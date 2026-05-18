@@ -155,3 +155,20 @@ opposite-direction peer copies:
 ./gpu_p2p.py --mem 1G --iters 20 --bidirectional
 ./gpu_p2p.py --devices 0 1 2 3 --mem 512M --iters 50
 ```
+
+`gpu_ops.py` validates CUDA operation families according to each visible GPU's
+compute capability. Runtime checks exercise memory copy, CUDA graphs, CUDA core
+arithmetic, atomics, and tensor-core GEMM modes that apply to the detected
+architecture. Optional compile probes check architecture-specific PTX and CUDA
+intrinsics such as Ampere `cp.async`, Hopper WGMMA, DPX and `cp.async.bulk`,
+and Blackwell `tcgen05`:
+
+```plain
+./gpu_ops.py --devices 0 --size 128 --compile-probes
+./gpu_ops.py --devices 0 1 2 3 --size 256
+./gpu_ops.py --list
+```
+
+H100/H200 are Hopper `sm_90` GPUs, so they map to WGMMA, TMA /
+`cp.async.bulk`, DPX, FP8 tensor cores, and thread-block clusters. `tcgen05` is
+mapped as a Blackwell `sm_100a` feature, not a Hopper feature.
