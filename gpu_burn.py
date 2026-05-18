@@ -22,7 +22,7 @@ except ImportError as exc:
         raise SystemExit(
             "PyTorch failed to import because libtorch_cuda.so is loading an "
             "NCCL runtime without ncclCommResume. This is a PyTorch/NCCL "
-            "install or LD_LIBRARY_PATH mismatch, not a gpu_burn_gemm.py GEMM "
+            "install or LD_LIBRARY_PATH mismatch, not a gpu_burn.py GEMM "
             "failure. Check `ldd .../torch/lib/libtorch_cuda.so | grep nccl`, "
             "unset NCCL/CUDA library overrides, or reinstall a matching "
             "torch + nvidia-nccl-cu13 stack."

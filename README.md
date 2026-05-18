@@ -98,16 +98,16 @@ can be set to change the resulting image tag:
 BF16 mode requires Compute Capability 8.0 or newer. FP8 modes require Compute
 Capability 8.9 or newer; H100/H200 support these FP8 paths.
 
-## Python GPU GEMM burn
+## Python GPU tools
 
-`gpu_burn_gemm.py` provides a PyTorch CUDA GEMM burn for FP32, FP64, FP16, BF16,
+`gpu_burn.py` provides a PyTorch CUDA GEMM burn for FP32, FP64, FP16, BF16,
 and FP8. Matrix allocation, GEMM output, validation, and elapsed-time
 measurement stay on CUDA; it uses CUDA events for timing and CUDA graphs by
 default to avoid including Python dispatch overhead in the reported GEMM time.
 
 ```plain
-./gpu_burn_gemm.py --modes all --size 8192 --iters 100
-./gpu_burn_gemm.py --modes fp8 fp8-e5m2 --size 8192 --iters 100 --device 0
+./gpu_burn.py --modes all --size 8192 --iters 100
+./gpu_burn.py --modes fp8 fp8-e5m2 --size 8192 --iters 100 --device 0
 ```
 
 `all` runs FP32, FP64, FP16, BF16, and the default supported FP8 E4M3 path.
@@ -126,3 +126,19 @@ ldd ~/.local/lib/python*/site-packages/torch/lib/libtorch_cuda.so | grep nccl
 
 Unset conflicting `LD_LIBRARY_PATH` entries or reinstall matching `torch` and
 `nvidia-nccl-cu13` packages.
+
+`gpu_bandwidth.py` measures internal device memory bandwidth with GPU-resident
+device-to-device copies and CUDA event timing:
+
+```plain
+./gpu_bandwidth.py --device 0 --gib 4 --iters 100
+./gpu_bandwidth.py --device 0 --gib 2 --streams 4 --iters 100
+```
+
+`gpu_p2p.py` reports visible GPU pair connectivity from `nvidia-smi topo -m`,
+checks CUDA peer-access support, and measures GPU-to-GPU peer-copy bandwidth:
+
+```plain
+./gpu_p2p.py --mib 1024 --iters 20
+./gpu_p2p.py --devices 0 1 2 3 --mib 512 --iters 50
+```
