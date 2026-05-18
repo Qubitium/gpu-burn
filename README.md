@@ -106,11 +106,17 @@ measurement stay on CUDA; it uses CUDA events for timing and CUDA graphs by
 default to avoid including Python dispatch overhead in the reported GEMM time.
 
 ```plain
-./gpu_burn.py --modes all --size 8192 --iters 100
-./gpu_burn.py --modes fp8 fp8-e5m2 --size 8192 --iters 100 --device 0
+./gpu_burn.py --modes ALL --size 8192 --time 10
+./gpu_burn.py --modes FP8,FP8-E5M2 --size 8192 --time 10 --device 0
 ```
 
-`all` runs FP32, FP64, FP16, BF16, and the default supported FP8 E4M3 path.
+`--size` is the square GEMM dimension, so `--size 8192` multiplies two
+8192x8192 matrices. `--time` is the target seconds of GPU-event GEMM time per
+selected mode. Use `--iters` instead of `--time` when an exact GEMM count is
+needed. `--modes` is one comma-delimited argument; for example,
+`--modes FP32,FP64,BF16`.
+
+`ALL` runs FP32, FP64, FP16, BF16, and the default supported FP8 E4M3 path.
 `fp8-e5m2` is available as an explicit optional mode and is skipped cleanly when
 the local cuBLASLt build does not support that exact datatype/layout/output
 combination. FP8 in the Python tool uses cuBLASLt directly and requires Compute

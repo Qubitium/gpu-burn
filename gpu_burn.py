@@ -10,6 +10,7 @@ CUDA graph so CPU dispatch overhead is not included in the reported GEMM time.
 import argparse
 import ctypes
 import ctypes.util
+import math
 import sys
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -41,6 +42,9 @@ CUBLASLT_MATMUL_DESC_POINTER_MODE = 2
 CUBLASLT_MATMUL_DESC_TRANSA = 3
 CUBLASLT_MATMUL_DESC_TRANSB = 4
 CUBLAS_STATUS_SUCCESS = 0
+DEFAULT_TIME_SECONDS = 10.0
+MIN_CALIBRATION_MS = 25.0
+MAX_CALIBRATION_ITERS = 1024
 
 
 class UnsupportedMode(RuntimeError):
@@ -224,9 +228,15 @@ MODES = {
 }
 
 
-def parse_modes(values):
+def parse_modes(value):
+    values = [item.strip().lower() for item in value.split(",")]
+    if any(item == "" for item in values):
+        raise SystemExit("--modes must be comma-delimited without empty entries")
     if values == ["all"]:
         return ["fp32", "fp64", "fp16", "bf16", "fp8"]
+    if "all" in values:
+        raise SystemExit("--modes all cannot be combined with other modes")
+
     modes = []
     for value in values:
         if value not in MODES:
@@ -259,6 +269,49 @@ def make_op(mode, n, device):
         torch.mm(a, b, out=out)
 
     return matmul
+
+
+def run_iterations(op, graph, a, b, out, iterations):
+    if graph is not None:
+        for _ in range(iterations):
+            graph.replay()
+        return
+
+    for _ in range(iterations):
+        op(a, b, out)
+
+
+def measure_iterations(op, graph, a, b, out, iterations):
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    run_iterations(op, graph, a, b, out, iterations)
+    end.record()
+    end.synchronize()
+    return start.elapsed_time(end)
+
+
+def iterations_for_time(op, graph, a, b, out, seconds):
+    target_ms = seconds * 1000.0
+    calibration_iters = 1
+
+    while True:
+        elapsed_ms = measure_iterations(
+            op, graph, a, b, out, calibration_iters)
+        if elapsed_ms >= MIN_CALIBRATION_MS:
+            break
+        if calibration_iters >= MAX_CALIBRATION_ITERS:
+            break
+        if elapsed_ms <= 0.0:
+            calibration_iters *= 2
+            continue
+
+        scale = math.ceil(MIN_CALIBRATION_MS / elapsed_ms)
+        calibration_iters *= max(2, min(scale, 16))
+        calibration_iters = min(calibration_iters, MAX_CALIBRATION_ITERS)
+
+    per_iter_ms = max(elapsed_ms / calibration_iters, 1.0e-9)
+    return max(1, math.ceil(target_ms / per_iter_ms))
 
 
 def run_mode(mode_name, args, device, capability):
@@ -298,18 +351,12 @@ def run_mode(mode_name, args, device, capability):
                 print(f"{mode.name}: CUDA graph disabled: {exc}")
                 torch.cuda.synchronize(device)
 
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        if graph is not None:
-            for _ in range(args.iters):
-                graph.replay()
-        else:
-            for _ in range(args.iters):
-                op(a, b, out)
-        end.record()
-        end.synchronize()
-        elapsed_ms = start.elapsed_time(end)
+        iterations = args.iters
+        if iterations is None:
+            iterations = iterations_for_time(
+                op, graph, a, b, out, args.time)
+
+        elapsed_ms = measure_iterations(op, graph, a, b, out, iterations)
 
         errors = 0
         max_diff = 0.0
@@ -322,11 +369,14 @@ def run_mode(mode_name, args, device, capability):
             errors = int((bad + nonfinite).item())
             max_diff = float(max_diff_gpu.item())
 
-        ops = 2.0 * args.size * args.size * args.size * args.iters
+        ops = 2.0 * args.size * args.size * args.size * iterations
         tflops = ops / (elapsed_ms / 1000.0) / 1.0e12
         graph_text = "graph" if graph is not None else "eager"
+        run_text = f"{iterations} GEMMs"
+        if args.time is not None:
+            run_text += f", target={args.time:.3f}s"
         print(
-            f"{mode.name}: {args.iters} GEMMs, n={args.size}, "
+            f"{mode.name}: {run_text}, n={args.size}, "
             f"{elapsed_ms:.3f} ms GPU-event time, {tflops:.2f} TFLOP/s, "
             f"errors={errors}, max_diff={max_diff:.6g}, {graph_text}"
         )
@@ -343,12 +393,16 @@ def main():
     parser = argparse.ArgumentParser(
         description="GPU-resident GEMM burn using CUDA events for timing")
     parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--size", type=int, default=8192)
-    parser.add_argument("--iters", type=int, default=100)
+    parser.add_argument("--size", type=int, default=8192,
+                        help="square GEMM dimension; N means NxN matrices")
+    parser.add_argument("--time", type=float,
+                        help="seconds of GPU-event GEMM time per selected mode")
+    parser.add_argument("--iters", type=int,
+                        help="exact GEMM count per selected mode")
     parser.add_argument("--warmup", type=int, default=3)
-    parser.add_argument("--modes", nargs="+", default=["all"],
-                        help=("all, fp32, fp64, fp16, bf16, fp8, fp8-e4m3, "
-                              "fp8-e5m2"))
+    parser.add_argument("--modes", default="ALL",
+                        help=("comma-delimited modes: ALL, FP32, FP64, FP16, "
+                              "BF16, FP8, FP8-E4M3, FP8-E5M2"))
     parser.add_argument("--no-graph", dest="graph", action="store_false",
                         help="do not capture GEMM in a CUDA graph")
     parser.add_argument("--no-validate", action="store_true",
@@ -357,6 +411,19 @@ def main():
                         help="treat skipped modes or graph capture failures as errors")
     parser.set_defaults(graph=True)
     args = parser.parse_args()
+
+    if args.size <= 0:
+        raise SystemExit("--size must be positive")
+    if args.time is not None and args.time <= 0.0:
+        raise SystemExit("--time must be positive")
+    if args.iters is not None and args.iters <= 0:
+        raise SystemExit("--iters must be positive")
+    if args.time is not None and args.iters is not None:
+        raise SystemExit("--time and --iters are mutually exclusive")
+    if args.time is None and args.iters is None:
+        args.time = DEFAULT_TIME_SECONDS
+    if args.warmup < 0:
+        raise SystemExit("--warmup must be non-negative")
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is not available to PyTorch")
