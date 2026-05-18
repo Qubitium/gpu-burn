@@ -97,3 +97,18 @@ can be set to change the resulting image tag:
 
 BF16 mode requires Compute Capability 8.0 or newer. FP8 modes require Compute
 Capability 8.9 or newer; H100/H200 support these FP8 paths.
+
+## Python GPU GEMM burn
+
+`gpu_burn_gemm.py` provides a PyTorch CUDA GEMM burn for FP32, FP16, BF16, and
+FP8. Matrix allocation, GEMM output, validation, and elapsed-time measurement
+stay on CUDA; it uses CUDA events for timing and CUDA graphs by default to avoid
+including Python dispatch overhead in the reported GEMM time.
+
+```plain
+./gpu_burn_gemm.py --modes all --size 8192 --iters 100
+./gpu_burn_gemm.py --modes fp8 fp8-e5m2 --size 8192 --iters 100 --device 0
+```
+
+FP8 in the Python tool uses cuBLASLt directly and requires Compute Capability
+8.9 or newer.
