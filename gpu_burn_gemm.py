@@ -30,6 +30,10 @@ CUBLASLT_MATMUL_DESC_TRANSB = 4
 CUBLAS_STATUS_SUCCESS = 0
 
 
+class UnsupportedMode(RuntimeError):
+    pass
+
+
 def load_library(name):
     path = ctypes.util.find_library(name)
     if not path:
@@ -90,6 +94,8 @@ class CublasLt:
             return
         msg = self.lib.cublasLtGetStatusString(status)
         text = msg.decode("utf-8") if msg else f"status {status}"
+        if "not supported" in text.lower():
+            raise UnsupportedMode(f"{desc}: {text}")
         raise RuntimeError(f"{desc}: {text}")
 
     def close(self):
@@ -206,7 +212,7 @@ MODES = {
 
 def parse_modes(values):
     if values == ["all"]:
-        return ["fp32", "fp16", "bf16", "fp8", "fp8-e5m2"]
+        return ["fp32", "fp16", "bf16", "fp8"]
     modes = []
     for value in values:
         if value not in MODES:
@@ -310,6 +316,10 @@ def run_mode(mode_name, args, device, capability):
             f"{elapsed_ms:.3f} ms GPU-event time, {tflops:.2f} TFLOP/s, "
             f"errors={errors}, max_diff={max_diff:.6g}, {graph_text}"
         )
+    except UnsupportedMode as exc:
+        if args.strict:
+            raise
+        print(f"{mode.name}: skipped, {exc}")
     finally:
         if isinstance(op, Fp8LtMatmul):
             op.close()

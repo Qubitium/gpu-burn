@@ -110,5 +110,7 @@ including Python dispatch overhead in the reported GEMM time.
 ./gpu_burn_gemm.py --modes fp8 fp8-e5m2 --size 8192 --iters 100 --device 0
 ```
 
-FP8 in the Python tool uses cuBLASLt directly and requires Compute Capability
-8.9 or newer.
+`all` runs the default supported FP8 E4M3 path. `fp8-e5m2` is available as an
+explicit optional mode and is skipped cleanly when the local cuBLASLt build does
+not support that exact datatype/layout/output combination. FP8 in the Python
+tool uses cuBLASLt directly and requires Compute Capability 8.9 or newer.
