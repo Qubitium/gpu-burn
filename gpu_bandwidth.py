@@ -8,6 +8,7 @@ printed after synchronization.
 """
 
 import argparse
+import re
 import sys
 
 try:
@@ -24,8 +25,32 @@ except ImportError as exc:
     raise
 
 
-def bytes_from_gib(value):
-    return int(value * 1024 * 1024 * 1024)
+def bytes_from_mem(value):
+    match = re.fullmatch(r"\s*([0-9]+(?:[.][0-9]+)?)\s*([kKmMgG]?)\s*", value)
+    if not match:
+        raise argparse.ArgumentTypeError(
+            "memory must look like 4096, 512M, 4G, or 0.5G")
+
+    amount = float(match.group(1))
+    suffix = match.group(2).lower()
+    multiplier = {
+        "": 1024 * 1024,
+        "k": 1024,
+        "m": 1024 * 1024,
+        "g": 1024 * 1024 * 1024,
+    }[suffix]
+    size = int(amount * multiplier)
+    if size <= 0:
+        raise argparse.ArgumentTypeError("memory must be positive")
+    return size
+
+
+def mem_label(num_bytes):
+    gib = num_bytes / 1024.0 / 1024.0 / 1024.0
+    if gib >= 1.0:
+        return f"{gib:.3f}G"
+    mib = num_bytes / 1024.0 / 1024.0
+    return f"{mib:.3f}M"
 
 
 def make_pattern(numel, device):
@@ -36,8 +61,8 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="GPU-resident device-to-device bandwidth burn")
     parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--gib", type=float, default=4.0,
-                        help="buffer size per device tensor")
+    parser.add_argument("--mem", type=bytes_from_mem, default=bytes_from_mem("4G"),
+                        help="buffer size per device tensor, e.g. 4096M or 4G")
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--streams", type=int, default=1,
@@ -53,8 +78,8 @@ def parse_args():
 
 
 def validate_args(args):
-    if args.gib <= 0:
-        raise SystemExit("--gib must be positive")
+    if args.mem <= 0:
+        raise SystemExit("--mem must be positive")
     if args.iters <= 0:
         raise SystemExit("--iters must be positive")
     if args.warmup < 0:
@@ -95,7 +120,7 @@ def run():
     torch.cuda.set_device(args.device)
     device = torch.device("cuda", args.device)
     capability = torch.cuda.get_device_capability(device)
-    numel = bytes_from_gib(args.gib)
+    numel = args.mem
 
     print(f"device={args.device} {torch.cuda.get_device_name(device)} "
           f"cc={capability[0]}.{capability[1]}")
@@ -155,7 +180,7 @@ def run():
     graph_text = "graph" if graph is not None else "eager"
     print(
         f"bandwidth: {args.iters} copies, {args.streams} stream(s), "
-        f"{args.gib:.3f} GiB per stream, {elapsed_ms:.3f} ms GPU-event time, "
+        f"{mem_label(numel)} per stream, {elapsed_ms:.3f} ms GPU-event time, "
         f"{gib_per_s:.2f} GiB/s ({gb_per_s:.2f} GB/s), errors={errors}, "
         f"{graph_text}"
     )

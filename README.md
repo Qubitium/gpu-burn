@@ -131,14 +131,14 @@ Unset conflicting `LD_LIBRARY_PATH` entries or reinstall matching `torch` and
 device-to-device copies and CUDA event timing:
 
 ```plain
-./gpu_bandwidth.py --device 0 --gib 4 --iters 100
-./gpu_bandwidth.py --device 0 --gib 2 --streams 4 --iters 100
+./gpu_bandwidth.py --device 0 --mem 4G --iters 100
+./gpu_bandwidth.py --device 0 --mem 2G --streams 4 --iters 100
 ```
 
 `gpu_p2p.py` reports visible GPU pair connectivity from `nvidia-smi topo -m`,
 checks CUDA peer-access support, and measures GPU-to-GPU peer-copy bandwidth:
 
 ```plain
-./gpu_p2p.py --mib 1024 --iters 20
-./gpu_p2p.py --devices 0 1 2 3 --mib 512 --iters 50
+./gpu_p2p.py --mem 1G --iters 20
+./gpu_p2p.py --devices 0 1 2 3 --mem 512M --iters 50
 ```

@@ -24,8 +24,24 @@ except ImportError as exc:
     raise
 
 
-def bytes_from_mib(value):
-    return int(value * 1024 * 1024)
+def bytes_from_mem(value):
+    match = re.fullmatch(r"\s*([0-9]+(?:[.][0-9]+)?)\s*([kKmMgG]?)\s*", value)
+    if not match:
+        raise argparse.ArgumentTypeError(
+            "memory must look like 1024, 512M, 1G, or 0.5G")
+
+    amount = float(match.group(1))
+    suffix = match.group(2).lower()
+    multiplier = {
+        "": 1024 * 1024,
+        "k": 1024,
+        "m": 1024 * 1024,
+        "g": 1024 * 1024 * 1024,
+    }[suffix]
+    size = int(amount * multiplier)
+    if size <= 0:
+        raise argparse.ArgumentTypeError("memory must be positive")
+    return size
 
 
 def parse_args():
@@ -33,7 +49,7 @@ def parse_args():
         description="GPU peer-to-peer connectivity and bandwidth test")
     parser.add_argument("--devices", nargs="*", type=int,
                         help="visible CUDA device indices to test")
-    parser.add_argument("--mib", type=float, default=1024.0,
+    parser.add_argument("--mem", type=bytes_from_mem, default=bytes_from_mem("1G"),
                         help="copy buffer size per peer transfer")
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--warmup", type=int, default=3)
@@ -43,8 +59,8 @@ def parse_args():
 
 
 def validate_args(args):
-    if args.mib <= 0:
-        raise SystemExit("--mib must be positive")
+    if args.mem <= 0:
+        raise SystemExit("--mem must be positive")
     if args.iters <= 0:
         raise SystemExit("--iters must be positive")
     if args.warmup < 0:
@@ -151,7 +167,7 @@ def run():
     if len(devices) < 2:
         raise SystemExit("at least two visible CUDA devices are required")
 
-    numel = bytes_from_mib(args.mib)
+    numel = args.mem
     matrix = topo_matrix()
     print("visible devices:")
     for device in devices:
