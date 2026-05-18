@@ -173,16 +173,19 @@ def run():
         errors = int(total.item())
 
     total_bytes = numel * args.streams * args.iters
-    gib = total_bytes / 1024.0 / 1024.0 / 1024.0
     seconds = elapsed_ms / 1000.0
-    gib_per_s = gib / seconds
-    gb_per_s = (total_bytes / 1.0e9) / seconds
+    payload_gib_s = (total_bytes / 1024.0 / 1024.0 / 1024.0) / seconds
+    payload_gb_s = (total_bytes / 1.0e9) / seconds
+    hbm_bytes = total_bytes * 2
+    hbm_gib_s = (hbm_bytes / 1024.0 / 1024.0 / 1024.0) / seconds
+    hbm_gb_s = (hbm_bytes / 1.0e9) / seconds
     graph_text = "graph" if graph is not None else "eager"
     print(
         f"bandwidth: {args.iters} copies, {args.streams} stream(s), "
         f"{mem_label(numel)} per stream, {elapsed_ms:.3f} ms GPU-event time, "
-        f"{gib_per_s:.2f} GiB/s ({gb_per_s:.2f} GB/s), errors={errors}, "
-        f"{graph_text}"
+        f"payload={payload_gib_s:.2f} GiB/s ({payload_gb_s:.2f} GB/s), "
+        f"hbm_read_write={hbm_gib_s:.2f} GiB/s ({hbm_gb_s:.2f} GB/s), "
+        f"errors={errors}, {graph_text}"
     )
 
 

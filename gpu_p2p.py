@@ -53,6 +53,9 @@ def parse_args():
                         help="copy buffer size per peer transfer")
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--warmup", type=int, default=3)
+    parser.add_argument("--bidirectional", action="store_true",
+                        help=("copy both directions simultaneously and report "
+                              "aggregate payload bandwidth"))
     parser.add_argument("--no-validate", action="store_true",
                         help="skip GPU-side copy validation")
     return parser.parse_args()
@@ -152,6 +155,73 @@ def measure_pair(src_id, dst_id, numel, args):
     return elapsed_ms, gib_s, gb_s, errors
 
 
+def measure_bidirectional_pair(src_id, dst_id, numel, args):
+    src_device = torch.device("cuda", src_id)
+    dst_device = torch.device("cuda", dst_id)
+    source_src = make_pattern(numel, src_device, src_id * 17 + dst_id)
+    source_dst = make_pattern(numel, dst_device, dst_id * 17 + src_id)
+    with torch.cuda.device(src_device):
+        target_src = torch.empty(numel, device=src_device, dtype=torch.uint8)
+        src_stream = torch.cuda.Stream(device=src_device)
+        start_src = torch.cuda.Event(enable_timing=True)
+        end_src = torch.cuda.Event(enable_timing=True)
+    with torch.cuda.device(dst_device):
+        target_dst = torch.empty(numel, device=dst_device, dtype=torch.uint8)
+        dst_stream = torch.cuda.Stream(device=dst_device)
+        start_dst = torch.cuda.Event(enable_timing=True)
+        end_dst = torch.cuda.Event(enable_timing=True)
+
+    for _ in range(args.warmup):
+        with torch.cuda.stream(dst_stream):
+            target_dst.copy_(source_src, non_blocking=True)
+        with torch.cuda.stream(src_stream):
+            target_src.copy_(source_dst, non_blocking=True)
+    dst_stream.synchronize()
+    src_stream.synchronize()
+
+    with torch.cuda.stream(dst_stream):
+        start_dst.record(dst_stream)
+        for _ in range(args.iters):
+            target_dst.copy_(source_src, non_blocking=True)
+        end_dst.record(dst_stream)
+    with torch.cuda.stream(src_stream):
+        start_src.record(src_stream)
+        for _ in range(args.iters):
+            target_src.copy_(source_dst, non_blocking=True)
+        end_src.record(src_stream)
+    end_dst.synchronize()
+    end_src.synchronize()
+
+    elapsed_ms = max(
+        start_dst.elapsed_time(end_dst),
+        start_src.elapsed_time(end_src),
+    )
+
+    errors = 0
+    if not args.no_validate:
+        with torch.cuda.device(dst_device):
+            bad_dst = torch.count_nonzero(target_dst != source_src.to(dst_device))
+        with torch.cuda.device(src_device):
+            bad_src = torch.count_nonzero(target_src != source_dst.to(src_device))
+        torch.cuda.synchronize(dst_device)
+        torch.cuda.synchronize(src_device)
+        errors = int(bad_dst.item()) + int(bad_src.item())
+
+    total_bytes = numel * args.iters * 2
+    seconds = elapsed_ms / 1000.0
+    gib_s = (total_bytes / 1024.0 / 1024.0 / 1024.0) / seconds
+    gb_s = (total_bytes / 1.0e9) / seconds
+    return elapsed_ms, gib_s, gb_s, errors
+
+
+def combined_topo(matrix, src, dst):
+    forward = connection_label(matrix, src, dst)
+    reverse = connection_label(matrix, dst, src)
+    if forward == reverse:
+        return forward
+    return f"{forward}/{reverse}"
+
+
 def run():
     args = parse_args()
     validate_args(args)
@@ -174,7 +244,32 @@ def run():
         props = torch.cuda.get_device_properties(device)
         print(f"  cuda:{device} {props.name} "
               f"cc={props.major}.{props.minor} bus={props.pci_bus_id}")
-    print("src -> dst, topo, peer_access, bandwidth")
+    if args.bidirectional:
+        print("src <-> dst, topo, peer_access, aggregate bidirectional payload bandwidth")
+    else:
+        print("src -> dst, topo, peer_access, one-way payload bandwidth")
+
+    if args.bidirectional:
+        for index, src in enumerate(devices):
+            for dst in devices[index + 1:]:
+                topo = combined_topo(matrix, src, dst)
+                forward_peer = can_access_peer(src, dst)
+                reverse_peer = can_access_peer(dst, src)
+                if not forward_peer or not reverse_peer:
+                    print(f"{src} <-> {dst}: {topo}, peer_access=no, skipped")
+                    continue
+                try:
+                    elapsed_ms, gib_s, gb_s, errors = measure_bidirectional_pair(
+                        src, dst, numel, args)
+                    print(
+                        f"{src} <-> {dst}: {topo}, peer_access=yes, "
+                        f"bidirectional_payload={gib_s:.2f} GiB/s "
+                        f"({gb_s:.2f} GB/s), {elapsed_ms:.3f} ms, "
+                        f"errors={errors}"
+                    )
+                except RuntimeError as exc:
+                    print(f"{src} <-> {dst}: {topo}, peer_access=yes, failed: {exc}")
+        return
 
     for src in devices:
         for dst in devices:
@@ -190,7 +285,7 @@ def run():
                     src, dst, numel, args)
                 print(
                     f"{src} -> {dst}: {topo}, peer_access=yes, "
-                    f"{gib_s:.2f} GiB/s ({gb_s:.2f} GB/s), "
+                    f"one_way_payload={gib_s:.2f} GiB/s ({gb_s:.2f} GB/s), "
                     f"{elapsed_ms:.3f} ms, errors={errors}"
                 )
             except RuntimeError as exc:

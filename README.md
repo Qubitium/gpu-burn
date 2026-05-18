@@ -134,7 +134,9 @@ Unset conflicting `LD_LIBRARY_PATH` entries or reinstall matching `torch` and
 `nvidia-nccl-cu13` packages.
 
 `gpu_bandwidth.py` measures internal device memory bandwidth with GPU-resident
-device-to-device copies and CUDA event timing:
+device-to-device copies and CUDA event timing. It reports copy payload bandwidth
+plus estimated HBM read+write bandwidth, which is the comparable number for HBM
+spec sheets:
 
 ```plain
 ./gpu_bandwidth.py --device 0 --mem 4G --iters 100
@@ -142,9 +144,14 @@ device-to-device copies and CUDA event timing:
 ```
 
 `gpu_p2p.py` reports visible GPU pair connectivity from `nvidia-smi topo -m`,
-checks CUDA peer-access support, and measures GPU-to-GPU peer-copy bandwidth:
+checks CUDA peer-access support, and measures GPU-to-GPU peer-copy bandwidth.
+The default output is one-way payload bandwidth. On A100 `NV12` links, compare
+that value with roughly 300 GB/s; NVIDIA's 600 GB/s NVLink number is
+bidirectional link capacity. Use `--bidirectional` to diagnose simultaneous
+opposite-direction peer copies:
 
 ```plain
 ./gpu_p2p.py --mem 1G --iters 20
+./gpu_p2p.py --mem 1G --iters 20 --bidirectional
 ./gpu_p2p.py --devices 0 1 2 3 --mem 512M --iters 50
 ```
