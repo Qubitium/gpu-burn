@@ -160,17 +160,27 @@ opposite-direction peer copies:
 compute capability. Runtime checks exercise memory copy, CUDA graphs, CUDA core
 arithmetic, atomics, and tensor-core GEMM modes that apply to the detected
 architecture. Optional compile probes check architecture-specific PTX and CUDA
-intrinsics. For local `sm_80` Ampere GPUs, the compile probes cover `ldmatrix`,
-FP64 DMMA, INT4 MMA, binary BMMA, `cp.async`, `mbarrier`, `redux.sync`, and L2
-cache-hint policy instructions. Hopper probes cover WGMMA, DPX and
-`cp.async.bulk`; Blackwell probes cover `tcgen05`:
+intrinsics. The local GPU path validates only features expected on each detected
+device; use `--compile-all-archs` to compile the full sm_80+ ISA probe matrix
+with `nvcc` even on a machine without Hopper or Blackwell GPUs.
+
+The probe matrix covers representative PTX instruction families introduced for
+sm_80 and newer targets, including Ampere `mma.sync`/`mma.sp`, `cp.async`,
+`mbarrier`, `redux.sync`, and L2 priority/cache-policy instructions; sm_89+
+FP8 MMA and conversion instructions; Hopper `stmatrix`, WGMMA, DPX, cluster,
+TMA/tensor-map bulk copy, tensor-map proxy, multimem, and grid dependency
+control instructions; and Blackwell `tcgen05`, `st.bulk`, `stmatrix.b8`,
+cluster launch control, tensor-map and small-float conversion extensions, and
+f8/f6/f4 MMA probes:
 
 ```plain
 ./gpu_ops.py --devices 0 --size 128 --compile-probes
+./gpu_ops.py --compile-all-archs --strict
 ./gpu_ops.py --devices 0 1 2 3 --size 256
 ./gpu_ops.py --list
 ```
 
 H100/H200 are Hopper `sm_90` GPUs, so they map to WGMMA, TMA /
-`cp.async.bulk`, DPX, FP8 tensor cores, and thread-block clusters. `tcgen05` is
-mapped as a Blackwell `sm_100a` feature, not a Hopper feature.
+`cp.async.bulk`, DPX, FP8 tensor cores, tensor-map instructions, and
+thread-block clusters. `tcgen05` is mapped as a Blackwell `sm_100a` feature,
+not a Hopper feature.

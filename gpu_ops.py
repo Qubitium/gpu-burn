@@ -2,11 +2,10 @@
 """
 Validate CUDA architecture feature families exposed by the visible GPUs.
 
-This is a feature-family validator, not a full SASS instruction exerciser. It
-maps compute capability to the CUDA operations that should be available on that
-architecture, runs practical runtime tests for library-exposed operations, and
-optionally compiles small ISA probes for architecture-specific PTX/intrinsic
-features that are not directly exposed by PyTorch.
+This maps compute capability to the CUDA operations that should be available on
+that architecture, runs practical runtime tests for library-exposed operations,
+and optionally compiles architecture-specific PTX/intrinsic probes that exercise
+the documented opcode families introduced for sm_80 and newer targets.
 """
 
 import argparse
@@ -23,14 +22,10 @@ from typing import Callable, Optional, Tuple
 try:
     import torch
 except ImportError as exc:
-    message = str(exc)
-    if "ncclCommResume" in message:
-        raise SystemExit(
-            "PyTorch failed to import because libtorch_cuda.so is loading an "
-            "NCCL runtime without ncclCommResume. This is a PyTorch/NCCL "
-            "install or LD_LIBRARY_PATH mismatch, not a gpu_ops.py failure."
-        ) from exc
-    raise
+    torch = None
+    TORCH_IMPORT_ERROR = exc
+else:
+    TORCH_IMPORT_ERROR = None
 
 
 Capability = Tuple[int, int]
@@ -52,6 +47,16 @@ class Result:
     cc: str
     feature_id: str
     label: str
+    status: str
+    detail: str
+
+
+@dataclass
+class CompileResult:
+    feature_id: str
+    label: str
+    validator: str
+    arch: str
     status: str
     detail: str
 
@@ -121,6 +126,13 @@ FEATURES = [
         "Runs int8 x int8 -> int32 matrix multiply when PyTorch exposes it.",
     ),
     Feature(
+        "ampere_minmax_xorsign_abs",
+        "Ampere half/bfloat min/max xorsign.abs",
+        (8, 6),
+        "compile_minmax_xorsign_abs",
+        "Compiles min/max.xorsign.abs half-precision PTX instructions.",
+    ),
+    Feature(
         "tensor_core_ldmatrix",
         "Tensor Core ldmatrix matrix load",
         (7, 5),
@@ -149,6 +161,13 @@ FEATURES = [
         "Runs BF16 matrix multiply through torch/cuBLAS.",
     ),
     Feature(
+        "tensor_core_sparse_mma",
+        "Sparse Tensor Core MMA",
+        (8, 0),
+        "compile_mma_sparse",
+        "Compiles an sm_80 sparse mma.sp::ordered_metadata probe.",
+    ),
+    Feature(
         "tensor_core_subbyte_mma",
         "Sub-byte INT4 Tensor Core MMA",
         (8, 0),
@@ -170,11 +189,25 @@ FEATURES = [
         "Compiles an sm_80+ inline-PTX cp.async probe.",
     ),
     Feature(
+        "ampere_l2_priority_discard",
+        "Ampere L2 applypriority/discard",
+        (8, 0),
+        "compile_l2_priority_discard",
+        "Compiles sm_80 L2 applypriority and discard instructions.",
+    ),
+    Feature(
         "ampere_mbarrier",
         "Ampere shared-memory mbarrier",
         (8, 0),
         "compile_mbarrier",
         "Compiles sm_80 mbarrier init/invalidate instructions.",
+    ),
+    Feature(
+        "ampere_mbarrier_arrive_wait",
+        "Ampere mbarrier arrive/test/pending count",
+        (8, 0),
+        "compile_mbarrier_arrive_wait",
+        "Compiles mbarrier arrive, test_wait, and pending_count instructions.",
     ),
     Feature(
         "ampere_warp_redux",
@@ -198,6 +231,20 @@ FEATURES = [
         "Runs FP8 E4M3 cuBLASLt GEMM when hardware and cuBLASLt support it.",
     ),
     Feature(
+        "tensor_core_fp8_mma",
+        "FP8 PTX mma.sync",
+        (8, 9),
+        "compile_mma_fp8",
+        "Compiles e4m3/e5m2 mma.sync PTX for sm_89+.",
+    ),
+    Feature(
+        "fp8_conversion",
+        "FP8 conversion instructions",
+        (8, 9),
+        "compile_cvt_fp8",
+        "Compiles e4m3/e5m2 conversion instructions for sm_89+.",
+    ),
+    Feature(
         "hopper_dpx",
         "Hopper DPX intrinsics",
         (9, 0),
@@ -205,18 +252,109 @@ FEATURES = [
         "Compiles CUDA DPX intrinsic probes such as __vimax3_s32.",
     ),
     Feature(
+        "hopper_cluster_addressing",
+        "Hopper cluster shared-memory addressing",
+        (9, 0),
+        "compile_cluster_map_rank",
+        "Compiles mapa.shared::cluster and getctarank probes.",
+    ),
+    Feature(
+        "hopper_cluster_registers",
+        "Hopper cluster special registers",
+        (9, 0),
+        "compile_cluster_registers",
+        "Compiles reads of cluster id/rank and aggregate shared-memory registers.",
+    ),
+    Feature(
+        "hopper_cluster_barrier",
+        "Hopper cluster barrier",
+        (9, 0),
+        "compile_cluster_barrier",
+        "Compiles barrier.cluster arrive/wait instructions.",
+    ),
+    Feature(
+        "hopper_elect_sync",
+        "Hopper elect.sync",
+        (9, 0),
+        "compile_elect_sync",
+        "Compiles warp leader election instruction.",
+    ),
+    Feature(
+        "hopper_mbarrier_tx",
+        "Hopper mbarrier transaction accounting",
+        (9, 0),
+        "compile_mbarrier_tx",
+        "Compiles mbarrier expect_tx, complete_tx, and try_wait instructions.",
+    ),
+    Feature(
+        "hopper_stmatrix",
+        "Hopper stmatrix matrix store",
+        (9, 0),
+        "compile_stmatrix",
+        "Compiles a warp-level stmatrix shared-memory store probe.",
+    ),
+    Feature(
         "hopper_wgmma",
         "Hopper warp-group MMA",
         (9, 0),
         "compile_wgmma",
-        "Compiles sm_90a WGMMA proxy instructions.",
+        "Compiles sm_90a wgmma.mma_async plus group-control instructions.",
     ),
     Feature(
         "hopper_tma_cp_async_bulk",
         "Hopper TMA / cp.async.bulk",
         (9, 0),
         "compile_cp_async_bulk",
-        "Compiles an sm_90+ cp.async.bulk.prefetch probe.",
+        "Compiles sm_90 cp.async.bulk copy and prefetch probes.",
+    ),
+    Feature(
+        "hopper_cp_async_bulk_tensor",
+        "Hopper tensor-map cp.async.bulk.tensor",
+        (9, 0),
+        "compile_cp_async_bulk_tensor",
+        "Compiles tensor-map bulk async copy and prefetch instructions.",
+    ),
+    Feature(
+        "hopper_cp_reduce_async_bulk",
+        "Hopper cp.reduce.async.bulk",
+        (9, 0),
+        "compile_cp_reduce_async_bulk",
+        "Compiles sm_90 async bulk reduce-copy instruction.",
+    ),
+    Feature(
+        "hopper_cp_reduce_async_bulk_tensor",
+        "Hopper tensor-map cp.reduce.async.bulk.tensor",
+        (9, 0),
+        "compile_cp_reduce_async_bulk_tensor",
+        "Compiles tensor-map async bulk reduce-copy instructions.",
+    ),
+    Feature(
+        "hopper_tensormap_replace",
+        "Hopper tensor-map replace",
+        (9, 0),
+        "compile_tensormap_replace",
+        "Compiles architecture-specific tensormap.replace instructions.",
+    ),
+    Feature(
+        "hopper_tensormap_proxy",
+        "Hopper tensor-map proxy fence",
+        (9, 0),
+        "compile_tensormap_proxy",
+        "Compiles tensormap.cp_fenceproxy and fence.proxy.tensormap instructions.",
+    ),
+    Feature(
+        "hopper_multimem",
+        "Hopper multimem operations",
+        (9, 0),
+        "compile_multimem",
+        "Compiles multimem load-reduce, store, and reduction instructions.",
+    ),
+    Feature(
+        "hopper_grid_dependency_control",
+        "Hopper grid dependency control",
+        (9, 0),
+        "compile_griddepcontrol",
+        "Compiles griddepcontrol.wait and launch_dependents instructions.",
     ),
     Feature(
         "hopper_thread_block_cluster",
@@ -227,10 +365,80 @@ FEATURES = [
     ),
     Feature(
         "blackwell_tcgen05",
-        "Blackwell tcgen05 Tensor Core ISA",
+        "Blackwell tcgen05 alloc/dealloc",
         (10, 0),
         "compile_tcgen05",
-        "Compiles an sm_100a tcgen05 assembly probe when nvcc supports it.",
+        "Compiles tcgen05.alloc, dealloc, and relinquish_alloc_permit.",
+    ),
+    Feature(
+        "blackwell_tcgen05_ldst_wait",
+        "Blackwell tcgen05 load/store/wait",
+        (10, 0),
+        "compile_tcgen05_ldst_wait",
+        "Compiles tcgen05.ld, tcgen05.st, and tcgen05.wait instructions.",
+    ),
+    Feature(
+        "blackwell_tcgen05_cp_shift",
+        "Blackwell tcgen05 copy/shift",
+        (10, 0),
+        "compile_tcgen05_cp_shift",
+        "Compiles tcgen05.cp and tcgen05.shift instructions.",
+    ),
+    Feature(
+        "blackwell_tcgen05_mma",
+        "Blackwell tcgen05 MMA",
+        (10, 0),
+        "compile_tcgen05_mma",
+        "Compiles dense and sparse tcgen05.mma instructions.",
+    ),
+    Feature(
+        "blackwell_tcgen05_mma_ws",
+        "Blackwell tcgen05 weight-stationary MMA",
+        (10, 0),
+        "compile_tcgen05_mma_ws",
+        "Compiles dense and sparse tcgen05.mma.ws instructions.",
+    ),
+    Feature(
+        "blackwell_tcgen05_fence_commit",
+        "Blackwell tcgen05 fence/commit",
+        (10, 0),
+        "compile_tcgen05_fence_commit",
+        "Compiles tcgen05.fence and tcgen05.commit instructions.",
+    ),
+    Feature(
+        "blackwell_st_bulk",
+        "Blackwell st.bulk",
+        (10, 0),
+        "compile_st_bulk",
+        "Compiles sm_100 bulk shared-memory store instruction.",
+    ),
+    Feature(
+        "blackwell_stmatrix_b8",
+        "Blackwell stmatrix b8 shape",
+        (10, 0),
+        "compile_stmatrix_b8",
+        "Compiles sm_100a stmatrix m16n8 b8 matrix-store instructions.",
+    ),
+    Feature(
+        "blackwell_tensormap_replace_ext",
+        "Blackwell tensor-map replace extensions",
+        (10, 0),
+        "compile_tensormap_replace_ext",
+        "Compiles sm_100a tensormap.replace field extensions.",
+    ),
+    Feature(
+        "blackwell_small_float_conversion",
+        "Blackwell small-float conversion instructions",
+        (10, 0),
+        "compile_cvt_small_float",
+        "Compiles e2m3/e3m2/ue8m0 conversion instructions.",
+    ),
+    Feature(
+        "blackwell_cluster_launch_control",
+        "Blackwell cluster launch control",
+        (10, 0),
+        "compile_clusterlaunchcontrol",
+        "Compiles clusterlaunchcontrol.try_cancel and query_cancel instructions.",
     ),
     Feature(
         "blackwell_tensor_memory",
@@ -239,12 +447,32 @@ FEATURES = [
         None,
         "Mapped to sm_100a-family features. Runtime validation needs a tcgen05 kernel.",
     ),
+    Feature(
+        "blackwell_f8f6f4_mma",
+        "Blackwell f8/f6/f4 MMA",
+        (12, 0),
+        "compile_mma_f8f6f4",
+        "Compiles sm_120a dense and sparse f8/f6/f4 MMA probes.",
+    ),
 ]
 
 
 def cc_at_least(actual: Capability, required: Capability) -> bool:
     return actual[0] > required[0] or (
         actual[0] == required[0] and actual[1] >= required[1])
+
+
+def require_torch():
+    if torch is not None:
+        return
+    message = str(TORCH_IMPORT_ERROR)
+    if "ncclCommResume" in message:
+        raise SystemExit(
+            "PyTorch failed to import because libtorch_cuda.so is loading an "
+            "NCCL runtime without ncclCommResume. This is a PyTorch/NCCL "
+            "install or LD_LIBRARY_PATH mismatch, not a gpu_ops.py failure."
+        ) from TORCH_IMPORT_ERROR
+    raise SystemExit(f"PyTorch failed to import: {message}") from TORCH_IMPORT_ERROR
 
 
 def status_result(device, props, feature, status, detail):
@@ -447,7 +675,24 @@ VALIDATORS: dict[str, Callable] = {
 }
 
 
+COMPILE_CACHE: dict[str, str] = {}
+
+
 COMPILE_PROBES = {
+    "compile_minmax_xorsign_abs": (
+        "sm_86",
+        r"""
+        #include <cuda_runtime.h>
+        extern "C" __global__ void probe(unsigned short* out) {
+            unsigned short a = 0x3c00u, b = 0xbc00u, d0, d1;
+            asm volatile("min.xorsign.abs.f16 %0, %1, %2;"
+                         : "=h"(d0) : "h"(a), "h"(b));
+            asm volatile("max.xorsign.abs.f16 %0, %1, %2;"
+                         : "=h"(d1) : "h"(a), "h"(b));
+            if (threadIdx.x == 0) out[0] = d0 + d1;
+        }
+        """,
+    ),
     "compile_ldmatrix": (
         "sm_80",
         r"""
@@ -474,6 +719,24 @@ COMPILE_PROBES = {
                 : "=d"(d0), "=d"(d1)
                 : "d"(a), "d"(b), "d"(c0), "d"(c1));
             if (threadIdx.x == 0) out[0] = d0 + d1;
+        }
+        """,
+    ),
+    "compile_mma_sparse": (
+        "sm_80",
+        r"""
+        #include <cuda_runtime.h>
+        extern "C" __global__ void probe(int* out) {
+            unsigned a0 = 0, a1 = 0, b0 = 0, b1 = 0, e = 0;
+            int c0 = 0, c1 = 0, c2 = 0, c3 = 0, d0, d1, d2, d3;
+            asm volatile(
+                "mma.sp::ordered_metadata.sync.aligned.m16n8k32.row.col"
+                ".satfinite.s32.u8.u8.s32 "
+                "{%0,%1,%2,%3}, {%4,%5}, {%6,%7}, {%8,%9,%10,%11}, %12, 0x1;"
+                : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
+                : "r"(a0), "r"(a1), "r"(b0), "r"(b1),
+                  "r"(c0), "r"(c1), "r"(c2), "r"(c3), "r"(e));
+            if (threadIdx.x == 0) out[0] = d0 + d1 + d2 + d3;
         }
         """,
     ),
@@ -509,6 +772,38 @@ COMPILE_PROBES = {
         }
         """,
     ),
+    "compile_mma_fp8": (
+        "sm_89",
+        r"""
+        #include <cuda_runtime.h>
+        extern "C" __global__ void probe(int* out) {
+            unsigned a0 = 0, a1 = 0, a2 = 0, a3 = 0, b0 = 0, b1 = 0;
+            float c0 = 0, c1 = 0, c2 = 0, c3 = 0, d0, d1, d2, d3;
+            asm volatile(
+                "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e5m2.f32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};"
+                : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),
+                  "f"(c0), "f"(c1), "f"(c2), "f"(c3));
+            if (threadIdx.x == 0) out[0] = static_cast<int>(d0 + d1 + d2 + d3);
+        }
+        """,
+    ),
+    "compile_cvt_fp8": (
+        "sm_89",
+        r"""
+        #include <cuda_runtime.h>
+        extern "C" __global__ void probe(unsigned short* out) {
+            float a = 1.0f, b = -1.0f;
+            unsigned short e4, e5;
+            asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;"
+                         : "=h"(e4) : "f"(a), "f"(b));
+            asm volatile("cvt.rn.satfinite.e5m2x2.f32 %0, %1, %2;"
+                         : "=h"(e5) : "f"(a), "f"(b));
+            if (threadIdx.x == 0) out[0] = e4 + e5;
+        }
+        """,
+    ),
     "compile_cp_async": (
         "sm_80",
         r"""
@@ -526,6 +821,17 @@ COMPILE_PROBES = {
         }
         """,
     ),
+    "compile_l2_priority_discard": (
+        "sm_80",
+        r"""
+        #include <cuda_runtime.h>
+        extern "C" __global__ void probe(int* ptr) {
+            asm volatile("applypriority.global.L2::evict_normal [%0], 128;"
+                         :: "l"(ptr));
+            asm volatile("discard.global.L2 [%0], 128;" :: "l"(ptr));
+        }
+        """,
+    ),
     "compile_mbarrier": (
         "sm_80",
         r"""
@@ -540,6 +846,33 @@ COMPILE_PROBES = {
                              :: "r"(addr));
                 out[0] = 1;
             }
+        }
+        """,
+    ),
+    "compile_mbarrier_arrive_wait": (
+        "sm_80",
+        r"""
+        #include <cuda_runtime.h>
+        extern "C" __global__ void probe(int* out) {
+            __shared__ unsigned long long barrier;
+            unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(&barrier));
+            unsigned long long state;
+            unsigned count, done;
+            if (threadIdx.x == 0) {
+                asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
+                             :: "r"(addr), "r"(1));
+            }
+            __syncthreads();
+            asm volatile("mbarrier.arrive.shared::cta.b64 %0, [%1];"
+                         : "=l"(state) : "r"(addr));
+            asm volatile(
+                "{ .reg .pred p; "
+                "mbarrier.test_wait.shared::cta.b64 p, [%1], %2; "
+                "selp.u32 %0, 1, 0, p; }"
+                : "=r"(done) : "r"(addr), "l"(state));
+            asm volatile("mbarrier.pending_count.b64 %0, %1;"
+                         : "=r"(count) : "l"(state));
+            if (threadIdx.x == 0) out[0] = done + count;
         }
         """,
     ),
@@ -585,14 +918,254 @@ COMPILE_PROBES = {
         }
         """,
     ),
+    "compile_cluster_map_rank": (
+        "sm_90",
+        r"""
+        #include <cuda_runtime.h>
+        extern "C" __global__ void probe(unsigned* out) {
+            extern __shared__ int smem[];
+            unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(smem));
+            unsigned mapped, rank;
+            asm volatile("mapa.shared::cluster.u32 %0, %1, 0;"
+                         : "=r"(mapped) : "r"(addr));
+            asm volatile("getctarank.shared::cluster.u32 %0, %1;"
+                         : "=r"(rank) : "r"(mapped));
+            if (threadIdx.x == 0) out[0] = mapped + rank;
+        }
+        """,
+    ),
+    "compile_cluster_registers": (
+        "sm_90",
+        r"""
+        #include <cuda_runtime.h>
+        extern "C" __global__ void probe(int* out) {
+            unsigned a, b, c, d, e, f, g;
+            asm volatile("mov.u32 %0, %%clusterid.x;" : "=r"(a));
+            asm volatile("mov.u32 %0, %%nclusterid.x;" : "=r"(b));
+            asm volatile("mov.u32 %0, %%cluster_ctaid.x;" : "=r"(c));
+            asm volatile("mov.u32 %0, %%cluster_nctaid.x;" : "=r"(d));
+            asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(e));
+            asm volatile("mov.u32 %0, %%cluster_nctarank;" : "=r"(f));
+            asm volatile("mov.u32 %0, %%aggr_smem_size;" : "=r"(g));
+            if (threadIdx.x == 0) out[0] = a + b + c + d + e + f + g;
+        }
+        """,
+    ),
+    "compile_cluster_barrier": (
+        "sm_90",
+        r"""
+        #include <cuda_runtime.h>
+        extern "C" __global__ void probe(int* out) {
+            asm volatile("barrier.cluster.arrive;\n\tbarrier.cluster.wait;");
+            if (threadIdx.x == 0) out[0] = 1;
+        }
+        """,
+    ),
+    "compile_elect_sync": (
+        "sm_90",
+        r"""
+        #include <cuda_runtime.h>
+        extern "C" __global__ void probe(int* out) {
+            unsigned r, p;
+            asm volatile(
+                "{ .reg .pred q; elect.sync %0|q, 0xffffffff; "
+                "selp.u32 %1, 1, 0, q; }"
+                : "=r"(r), "=r"(p));
+            if (threadIdx.x == 0) out[0] = r + p;
+        }
+        """,
+    ),
+    "compile_mbarrier_tx": (
+        "sm_90",
+        r"""
+        #include <cuda_runtime.h>
+        extern "C" __global__ void probe(int* out) {
+            __shared__ unsigned long long barrier;
+            unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(&barrier));
+            unsigned long long state;
+            unsigned done;
+            if (threadIdx.x == 0) {
+                asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
+                             :: "r"(addr), "r"(1));
+                asm volatile("mbarrier.expect_tx.shared::cta.b64 [%0], %1;"
+                             :: "r"(addr), "r"(16));
+                asm volatile("mbarrier.complete_tx.shared::cta.b64 [%0], %1;"
+                             :: "r"(addr), "r"(16));
+                out[0] = 1;
+            }
+            __syncthreads();
+            asm volatile("mbarrier.arrive.shared::cta.b64 %0, [%1];"
+                         : "=l"(state) : "r"(addr));
+            asm volatile(
+                "{ .reg .pred p; "
+                "mbarrier.try_wait.shared::cta.b64 p, [%1], %2; "
+                "selp.u32 %0, 1, 0, p; }"
+                : "=r"(done) : "r"(addr), "l"(state));
+            if (threadIdx.x == 0) out[0] += done;
+        }
+        """,
+    ),
+    "compile_stmatrix": (
+        "sm_90",
+        r"""
+        #include <cuda_runtime.h>
+        extern "C" __global__ void probe(int* out) {
+            __shared__ int smem[64];
+            unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(smem));
+            unsigned r = 0;
+            asm volatile("stmatrix.sync.aligned.m8n8.x1.shared.b16 [%0], {%1};"
+                         :: "r"(addr), "r"(r));
+            if (threadIdx.x == 0) out[0] = 1;
+        }
+        """,
+    ),
     "compile_cp_async_bulk": (
         "sm_90",
         r"""
         #include <cuda_runtime.h>
-        extern "C" __global__ void probe(const int* src) {
-            const void* ptr = src;
-            asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;"
-                         :: "l"(ptr));
+        extern "C" __global__ void probe(const int* src, int* out) {
+            __shared__ unsigned long long barrier;
+            __shared__ int smem[64];
+            unsigned barrier_addr =
+                static_cast<unsigned>(__cvta_generic_to_shared(&barrier));
+            unsigned smem_addr =
+                static_cast<unsigned>(__cvta_generic_to_shared(smem));
+            if (threadIdx.x == 0) {
+                asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
+                             :: "r"(barrier_addr), "r"(1));
+            }
+            __syncthreads();
+            asm volatile(
+                "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
+                "[%0], [%1], %2, [%3];"
+                :: "r"(smem_addr), "l"(src), "r"(128), "r"(barrier_addr));
+            asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;" :: "l"(src));
+            if (threadIdx.x == 0) out[0] = smem[0];
+        }
+        """,
+    ),
+    "compile_cp_async_bulk_tensor": (
+        "sm_90",
+        r"""
+        #include <cuda_runtime.h>
+        extern "C" __global__ void probe(const void* tensor_map, int* out) {
+            __shared__ unsigned long long barrier;
+            __shared__ int smem[64];
+            unsigned barrier_addr =
+                static_cast<unsigned>(__cvta_generic_to_shared(&barrier));
+            unsigned smem_addr =
+                static_cast<unsigned>(__cvta_generic_to_shared(smem));
+            int coord = 0;
+            if (threadIdx.x == 0) {
+                asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
+                             :: "r"(barrier_addr), "r"(1));
+            }
+            __syncthreads();
+            asm volatile(
+                "cp.async.bulk.tensor.1d.shared::cta.global"
+                ".mbarrier::complete_tx::bytes.tile "
+                "[%0], [%1, {%2}], [%3];"
+                :: "r"(smem_addr), "l"(tensor_map), "r"(coord),
+                   "r"(barrier_addr));
+            asm volatile(
+                "cp.async.bulk.prefetch.tensor.1d.L2.global.tile [%0, {%1}];"
+                :: "l"(tensor_map), "r"(coord));
+            if (threadIdx.x == 0) out[0] = smem[0];
+        }
+        """,
+    ),
+    "compile_cp_reduce_async_bulk": (
+        "sm_90",
+        r"""
+        #include <cuda_runtime.h>
+        extern "C" __global__ void probe(int* dst) {
+            extern __shared__ int smem[];
+            unsigned smem_addr =
+                static_cast<unsigned>(__cvta_generic_to_shared(smem));
+            asm volatile(
+                "cp.reduce.async.bulk.global.shared::cta.bulk_group.add.u32 "
+                "[%0], [%1], %2;"
+                :: "l"(dst), "r"(smem_addr), "r"(128));
+        }
+        """,
+    ),
+    "compile_cp_reduce_async_bulk_tensor": (
+        "sm_90",
+        r"""
+        #include <cuda_runtime.h>
+        extern "C" __global__ void probe(const void* tensor_map) {
+            __shared__ int smem[64];
+            unsigned smem_addr =
+                static_cast<unsigned>(__cvta_generic_to_shared(smem));
+            int coord = 0;
+            asm volatile(
+                "cp.reduce.async.bulk.tensor.1d.global.shared::cta"
+                ".add.tile.bulk_group [%0, {%1}], [%2];"
+                :: "l"(tensor_map), "r"(coord), "r"(smem_addr));
+            asm volatile("cp.async.bulk.commit_group;");
+            asm volatile("cp.async.bulk.wait_group 0;");
+        }
+        """,
+    ),
+    "compile_tensormap_replace": (
+        "sm_90a",
+        r"""
+        #include <cuda_runtime.h>
+        extern "C" __global__ void probe(int* out) {
+            __shared__ unsigned tensor_map[32];
+            unsigned addr =
+                static_cast<unsigned>(__cvta_generic_to_shared(tensor_map));
+            unsigned long long new_val = 0;
+            asm volatile(
+                "tensormap.replace.tile.global_address.shared::cta.b1024.b64 "
+                "[%0], %1;"
+                :: "r"(addr), "l"(new_val));
+            if (threadIdx.x == 0) out[0] = 1;
+        }
+        """,
+    ),
+    "compile_tensormap_proxy": (
+        "sm_90",
+        r"""
+        #include <cuda_runtime.h>
+        extern "C" __global__ void probe(unsigned* dst) {
+            __shared__ unsigned tensor_map[32];
+            unsigned src =
+                static_cast<unsigned>(__cvta_generic_to_shared(tensor_map));
+            asm volatile(
+                "tensormap.cp_fenceproxy.global.shared::cta"
+                ".tensormap::generic.release.gpu.sync.aligned "
+                "[%0], [%1], 128;"
+                :: "l"(dst), "r"(src));
+            asm volatile(
+                "fence.proxy.tensormap::generic.acquire.gpu [%0], 128;"
+                :: "l"(dst));
+        }
+        """,
+    ),
+    "compile_multimem": (
+        "sm_90",
+        r"""
+        #include <cuda_runtime.h>
+        extern "C" __global__ void probe(int* src, int* dst) {
+            int v;
+            asm volatile("multimem.ld_reduce.relaxed.sys.global.add.u32 %0, [%1];"
+                         : "=r"(v) : "l"(src));
+            asm volatile("multimem.st.relaxed.sys.global.u32 [%0], %1;"
+                         :: "l"(dst), "r"(v));
+            asm volatile("multimem.red.relaxed.sys.global.add.u32 [%0], %1;"
+                         :: "l"(dst), "r"(v));
+        }
+        """,
+    ),
+    "compile_griddepcontrol": (
+        "sm_90",
+        r"""
+        #include <cuda_runtime.h>
+        extern "C" __global__ void probe(int* out) {
+            asm volatile("griddepcontrol.wait;");
+            asm volatile("griddepcontrol.launch_dependents;");
+            if (threadIdx.x == 0) out[0] = 1;
         }
         """,
     ),
@@ -601,7 +1174,15 @@ COMPILE_PROBES = {
         r"""
         #include <cuda_runtime.h>
         extern "C" __global__ void probe() {
+            unsigned a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+            unsigned long long desc_b = 0;
+            float d0 = 0, d1 = 0, d2 = 0, d3 = 0;
             asm volatile("wgmma.fence.sync.aligned;");
+            asm volatile(
+                "wgmma.mma_async.sync.aligned.m64n8k16.f32.f16.f16 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, %8, 1, -1, -1, 1;"
+                : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "l"(desc_b));
             asm volatile("wgmma.commit_group.sync.aligned;");
             asm volatile("wgmma.wait_group.sync.aligned 0;");
         }
@@ -611,8 +1192,244 @@ COMPILE_PROBES = {
         "sm_100a",
         r"""
         #include <cuda_runtime.h>
-        extern "C" __global__ void probe() {
+        extern "C" __global__ void probe(int* out) {
+            __shared__ unsigned taddr_slot;
+            unsigned addr =
+                static_cast<unsigned>(__cvta_generic_to_shared(&taddr_slot));
+            unsigned taddr;
+            asm volatile(
+                "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 "
+                "[%0], 32;"
+                :: "r"(addr));
+            asm volatile("ld.shared.b32 %0, [%1];"
+                         : "=r"(taddr) : "r"(addr));
+            asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 32;"
+                         :: "r"(taddr));
             asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
+            if (threadIdx.x == 0) out[0] = static_cast<int>(taddr);
+        }
+        """,
+    ),
+    "compile_tcgen05_ldst_wait": (
+        "sm_100a",
+        r"""
+        #include <cuda_runtime.h>
+        extern "C" __global__ void probe(int* out) {
+            unsigned taddr = 0;
+            unsigned r0 = 0, r1 = 0;
+            asm volatile(
+                "tcgen05.ld.sync.aligned.32x32b.x2.b32 {%0, %1}, [%2];"
+                : "=r"(r0), "=r"(r1) : "r"(taddr));
+            asm volatile("tcgen05.wait::ld.sync.aligned;");
+            asm volatile(
+                "tcgen05.st.sync.aligned.32x32b.x2.b32 [%0], {%1, %2};"
+                :: "r"(taddr), "r"(r0), "r"(r1));
+            asm volatile("tcgen05.wait::st.sync.aligned;");
+            if (threadIdx.x == 0) out[0] = static_cast<int>(r0 + r1);
+        }
+        """,
+    ),
+    "compile_tcgen05_cp_shift": (
+        "sm_100a",
+        r"""
+        #include <cuda_runtime.h>
+        extern "C" __global__ void probe(int* out) {
+            unsigned taddr = 0;
+            unsigned long long sdesc = 0;
+            asm volatile("tcgen05.cp.cta_group::1.128x256b [%0], %1;"
+                         :: "r"(taddr), "l"(sdesc));
+            asm volatile("tcgen05.shift.cta_group::1.down [%0];"
+                         :: "r"(taddr));
+            if (threadIdx.x == 0) out[0] = 1;
+        }
+        """,
+    ),
+    "compile_tcgen05_mma": (
+        "sm_100a",
+        r"""
+        #include <cuda_runtime.h>
+        extern "C" __global__ void probe(int* out) {
+            unsigned daddr = 0, sp_meta = 0, idesc = 0;
+            unsigned m0 = 0, m1 = 0, m2 = 0, m3 = 0;
+            unsigned long long adesc = 0, bdesc = 0;
+            asm volatile(
+                "{ .reg .pred p; setp.ne.u32 p, 0, 1; "
+                "tcgen05.mma.cta_group::1.kind::tf32 "
+                "[%0], %1, %2, %3, {%4, %5, %6, %7}, p; }"
+                :: "r"(daddr), "l"(adesc), "l"(bdesc), "r"(idesc),
+                   "r"(m0), "r"(m1), "r"(m2), "r"(m3));
+            asm volatile(
+                "{ .reg .pred p; setp.ne.u32 p, 0, 1; "
+                "tcgen05.mma.sp.cta_group::1.kind::f16 "
+                "[%0], %1, %2, [%3], %4, {%5, %6, %7, %8}, p; }"
+                :: "r"(daddr), "l"(adesc), "l"(bdesc), "r"(sp_meta),
+                   "r"(idesc), "r"(m0), "r"(m1), "r"(m2), "r"(m3));
+            if (threadIdx.x == 0) out[0] = 1;
+        }
+        """,
+    ),
+    "compile_tcgen05_mma_ws": (
+        "sm_100a",
+        r"""
+        #include <cuda_runtime.h>
+        extern "C" __global__ void probe(int* out) {
+            unsigned daddr = 0, aaddr = 0, sp_meta = 0, idesc = 0;
+            unsigned long long bdesc = 0;
+            asm volatile(
+                "{ .reg .pred p; setp.ne.u32 p, 0, 1; "
+                "tcgen05.mma.ws.cta_group::1.kind::tf32 "
+                "[%0], [%1], %2, %3, p; }"
+                :: "r"(daddr), "r"(aaddr), "l"(bdesc), "r"(idesc));
+            asm volatile(
+                "{ .reg .pred p; setp.ne.u32 p, 0, 1; "
+                "tcgen05.mma.ws.sp.cta_group::1.kind::tf32 "
+                "[%0], [%1], %2, [%3], %4, p; }"
+                :: "r"(daddr), "r"(aaddr), "l"(bdesc), "r"(sp_meta),
+                   "r"(idesc));
+            if (threadIdx.x == 0) out[0] = 1;
+        }
+        """,
+    ),
+    "compile_tcgen05_fence_commit": (
+        "sm_100a",
+        r"""
+        #include <cuda_runtime.h>
+        extern "C" __global__ void probe(int* out) {
+            __shared__ unsigned long long barrier;
+            unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(&barrier));
+            if (threadIdx.x == 0) {
+                asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
+                             :: "r"(addr), "r"(1));
+            }
+            __syncthreads();
+            asm volatile("tcgen05.fence::before_thread_sync;");
+            asm volatile("tcgen05.fence::after_thread_sync;");
+            asm volatile(
+                "tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [%0];"
+                :: "r"(addr));
+            if (threadIdx.x == 0) out[0] = 1;
+        }
+        """,
+    ),
+    "compile_st_bulk": (
+        "sm_100",
+        r"""
+        #include <cuda_runtime.h>
+        extern "C" __global__ void probe(int* out) {
+            extern __shared__ int smem[];
+            unsigned smem_addr =
+                static_cast<unsigned>(__cvta_generic_to_shared(smem));
+            asm volatile("st.bulk.weak.shared::cta [%0], 4096, 0;"
+                         :: "r"(smem_addr));
+            if (threadIdx.x == 0) out[0] = 1;
+        }
+        """,
+    ),
+    "compile_stmatrix_b8": (
+        "sm_100a",
+        r"""
+        #include <cuda_runtime.h>
+        extern "C" __global__ void probe(int* out) {
+            __shared__ int smem[64];
+            unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(smem));
+            unsigned r = 0;
+            asm volatile(
+                "stmatrix.sync.aligned.m16n8.x1.trans.shared.b8 [%0], {%1};"
+                :: "r"(addr), "r"(r));
+            if (threadIdx.x == 0) out[0] = 1;
+        }
+        """,
+    ),
+    "compile_clusterlaunchcontrol": (
+        "sm_100",
+        r"""
+        #include <cuda_runtime.h>
+        extern "C" __global__ void probe(int* out) {
+            __shared__ unsigned long long barrier;
+            __shared__ unsigned handle[4];
+            unsigned barrier_addr =
+                static_cast<unsigned>(__cvta_generic_to_shared(&barrier));
+            unsigned handle_addr =
+                static_cast<unsigned>(__cvta_generic_to_shared(handle));
+            if (threadIdx.x == 0) {
+                asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
+                             :: "r"(barrier_addr), "r"(1));
+                asm volatile(
+                    "clusterlaunchcontrol.try_cancel.async"
+                    ".mbarrier::complete_tx::bytes.b128 [%0], [%1];"
+                    :: "r"(handle_addr), "r"(barrier_addr));
+                out[0] = 1;
+            }
+            unsigned pval, x, y, z, w;
+            asm volatile(
+                "{ .reg .pred p; .reg .b128 h; "
+                "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p, h; "
+                "clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128 "
+                "{%1, %2, %3, %4}, h; "
+                "selp.u32 %0, 1, 0, p; }"
+                : "=r"(pval), "=r"(x), "=r"(y), "=r"(z), "=r"(w));
+            if (threadIdx.x == 0) out[0] += pval + x + y + z + w;
+        }
+        """,
+    ),
+    "compile_tensormap_replace_ext": (
+        "sm_100a",
+        r"""
+        #include <cuda_runtime.h>
+        extern "C" __global__ void probe(int* out) {
+            __shared__ unsigned tensor_map[32];
+            unsigned addr =
+                static_cast<unsigned>(__cvta_generic_to_shared(tensor_map));
+            asm volatile(
+                "tensormap.replace.tile.swizzle_atomicity"
+                ".shared::cta.b1024.b32 [%0], 0;"
+                :: "r"(addr));
+            if (threadIdx.x == 0) out[0] = 1;
+        }
+        """,
+    ),
+    "compile_cvt_small_float": (
+        "sm_100a",
+        r"""
+        #include <cuda_runtime.h>
+        extern "C" __global__ void probe(unsigned short* out) {
+            float a = 1.0f, b = -1.0f;
+            unsigned short e23, e32, ue8;
+            asm volatile("cvt.rn.satfinite.e2m3x2.f32 %0, %1, %2;"
+                         : "=h"(e23) : "f"(a), "f"(b));
+            asm volatile("cvt.rn.satfinite.e3m2x2.f32 %0, %1, %2;"
+                         : "=h"(e32) : "f"(a), "f"(b));
+            asm volatile("cvt.rz.satfinite.ue8m0x2.f32 %0, %1, %2;"
+                         : "=h"(ue8) : "f"(a), "f"(b));
+            if (threadIdx.x == 0) out[0] = e23 + e32 + ue8;
+        }
+        """,
+    ),
+    "compile_mma_f8f6f4": (
+        "sm_120a",
+        r"""
+        #include <cuda_runtime.h>
+        extern "C" __global__ void probe(int* out) {
+            unsigned a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+            unsigned b0 = 0, b1 = 0, b2 = 0, b3 = 0, e = 0;
+            float c0 = 0, c1 = 0, c2 = 0, c3 = 0, d0, d1, d2, d3;
+            asm volatile(
+                "mma.sync.aligned.m16n8k32.row.col.kind::f8f6f4"
+                ".f32.e3m2.e2m3.f32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};"
+                : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),
+                  "f"(c0), "f"(c1), "f"(c2), "f"(c3));
+            asm volatile(
+                "mma.sp::ordered_metadata.sync.aligned.m16n8k64.row.col"
+                ".kind::f8f6f4.f32.e3m2.e2m3.f32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9,%10,%11}, "
+                "{%12,%13,%14,%15}, %16, 0;"
+                : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+                : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+                  "r"(b0), "r"(b1), "r"(b2), "r"(b3),
+                  "f"(c0), "f"(c1), "f"(c2), "f"(c3), "r"(e));
+            if (threadIdx.x == 0) out[0] = static_cast<int>(d0 + d1 + d2 + d3);
         }
         """,
     ),
@@ -622,6 +1439,8 @@ COMPILE_PROBES = {
 def compile_probe(validator):
     if validator not in COMPILE_PROBES:
         raise RuntimeError(f"unknown compile probe {validator}")
+    if validator in COMPILE_CACHE:
+        return COMPILE_CACHE[validator]
     arch, source = COMPILE_PROBES[validator]
     nvcc = shutil.which("nvcc")
     if not nvcc:
@@ -650,7 +1469,38 @@ def compile_probe(validator):
             detail = (proc.stderr or proc.stdout).strip().splitlines()
             message = detail[-1] if detail else f"nvcc exited {proc.returncode}"
             raise RuntimeError(message)
-    return f"compiled with {arch}"
+    COMPILE_CACHE[validator] = f"compiled with {arch}"
+    return COMPILE_CACHE[validator]
+
+
+def compile_all_arch_probes():
+    feature_by_validator = {
+        feature.validator: feature
+        for feature in FEATURES
+        if feature.validator is not None
+    }
+    results = []
+    for validator, (arch, _source) in COMPILE_PROBES.items():
+        feature = feature_by_validator.get(validator)
+        label = feature.label if feature else validator
+        feature_id = feature.feature_id if feature else validator
+        try:
+            detail = compile_probe(validator)
+            status = "pass"
+        except Exception as exc:
+            detail = str(exc)
+            status = "fail"
+        results.append(
+            CompileResult(
+                feature_id=feature_id,
+                label=label,
+                validator=validator,
+                arch=arch,
+                status=status,
+                detail=detail,
+            )
+        )
+    return results
 
 
 def run_feature(device, props, capability, feature, args):
@@ -700,6 +1550,8 @@ def parse_args():
                         help="element count for vector and memory probes")
     parser.add_argument("--compile-probes", action="store_true",
                         help="compile architecture-specific PTX/intrinsic probes with nvcc")
+    parser.add_argument("--compile-all-archs", action="store_true",
+                        help="compile every sm_80+ architecture PTX/intrinsic probe and exit")
     parser.add_argument("--list", action="store_true",
                         help="print the architecture feature map and exit")
     parser.add_argument("--json", action="store_true",
@@ -739,6 +1591,15 @@ def print_results(results):
         )
 
 
+def print_compile_results(results):
+    print("architecture PTX/ISA compile probes")
+    for result in results:
+        print(
+            f"  {result.status.upper():6} {result.arch:7} "
+            f"{result.feature_id}: {result.detail}"
+        )
+
+
 def main():
     args = parse_args()
     validate_args(args)
@@ -747,6 +1608,21 @@ def main():
         print_feature_map()
         return
 
+    compile_results = []
+    if args.compile_all_archs:
+        compile_results = compile_all_arch_probes()
+        if args.json:
+            print(json.dumps(
+                {"compile_probes": [asdict(result) for result in compile_results]},
+                indent=2,
+            ))
+        else:
+            print_compile_results(compile_results)
+        if args.strict and any(result.status == "fail" for result in compile_results):
+            raise SystemExit(1)
+        return
+
+    require_torch()
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is not available to PyTorch")
 
