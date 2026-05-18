@@ -212,6 +212,7 @@ class Mode:
 
 MODES = {
     "fp32": Mode("fp32", torch.float32, torch.float32, (0, 0), None, 1e-3),
+    "fp64": Mode("fp64", torch.float64, torch.float64, (0, 0), None, 1e-9),
     "fp16": Mode("fp16", torch.float16, torch.float16, (0, 0), None, 1e-2),
     "bf16": Mode("bf16", torch.bfloat16, torch.bfloat16, (8, 0), None, 1e-1),
     "fp8": Mode("fp8", torch.float8_e4m3fn, torch.float32, (8, 9),
@@ -225,7 +226,7 @@ MODES = {
 
 def parse_modes(values):
     if values == ["all"]:
-        return ["fp32", "fp16", "bf16", "fp8"]
+        return ["fp32", "fp64", "fp16", "bf16", "fp8"]
     modes = []
     for value in values:
         if value not in MODES:
@@ -346,7 +347,8 @@ def main():
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--modes", nargs="+", default=["all"],
-                        help="all, fp32, fp16, bf16, fp8, fp8-e4m3, fp8-e5m2")
+                        help=("all, fp32, fp64, fp16, bf16, fp8, fp8-e4m3, "
+                              "fp8-e5m2"))
     parser.add_argument("--no-graph", dest="graph", action="store_false",
                         help="do not capture GEMM in a CUDA graph")
     parser.add_argument("--no-validate", action="store_true",
