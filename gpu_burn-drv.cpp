@@ -51,6 +51,7 @@
 #include <stdexcept>
 #include <string.h>
 #include <string>
+#include <sys/select.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -67,6 +68,9 @@
 #define CUDA_ENABLE_DEPRECATED
 #include <cuda.h>
 #include <cuda_fp8.h>
+#if !IS_JETSON
+#include <nvml.h>
+#endif
 
 enum TestMode {
     TEST_FP32,
@@ -141,30 +145,6 @@ cublasComputeType_t computeType(TestMode mode) {
 }
 #endif
 
-uint16_t floatToBfloat16(float value) {
-    uint32_t bits;
-    memcpy(&bits, &value, sizeof(bits));
-    const uint32_t lsb = (bits >> 16) & 1u;
-    bits += 0x7fffu + lsb;
-    return (uint16_t)(bits >> 16);
-}
-
-template <class T> T convertInput(float value, TestMode mode) {
-    (void)mode;
-    return (T)value;
-}
-
-template <> uint16_t convertInput<uint16_t>(float value, TestMode mode) {
-    (void)mode;
-    return floatToBfloat16(value);
-}
-
-template <> uint8_t convertInput<uint8_t>(float value, TestMode mode) {
-    return __nv_cvt_float_to_fp8(
-        value, __NV_SATFINITE,
-        mode == TEST_FP8_E5M2 ? __NV_E5M2 : __NV_E4M3);
-}
-
 void selectTestMode(TestMode *mode, bool *modeSelected, TestMode selected,
                     const char *arg) {
     if (*modeSelected) {
@@ -210,16 +190,72 @@ void _checkError(cublasStatus_t rCode, std::string file, int line, std::string d
 #define checkError(rCode, ...)                                                 \
     _checkError(rCode, __FILE__, __LINE__, ##__VA_ARGS__)
 
-double getTime() {
-    struct timeval t;
-    gettimeofday(&t, NULL);
-    return (double)t.tv_sec + (double)t.tv_usec / 1e6;
+bool g_running = false;
+
+struct ClientReport {
+    int processed;
+    int errors;
+    float gpuMillis;
+};
+
+bool writeFull(int fd, const void *data, size_t bytes) {
+    const char *cursor = (const char *)data;
+    while (bytes > 0) {
+        ssize_t written = write(fd, cursor, bytes);
+        if (written < 0) {
+            if (errno == EINTR)
+                continue;
+            return false;
+        }
+        if (written == 0)
+            return false;
+        cursor += written;
+        bytes -= written;
+    }
+    return true;
 }
 
-bool g_running = false;
+bool readFull(int fd, void *data, size_t bytes) {
+    char *cursor = (char *)data;
+    while (bytes > 0) {
+        ssize_t bytesRead = read(fd, cursor, bytes);
+        if (bytesRead < 0) {
+            if (errno == EINTR)
+                continue;
+            return false;
+        }
+        if (bytesRead == 0)
+            return false;
+        cursor += bytesRead;
+        bytes -= bytesRead;
+    }
+    return true;
+}
+
+void writeClientReport(int writeFd, int processed, int errors,
+                       float gpuMillis) {
+    ClientReport report;
+    report.processed = processed;
+    report.errors = errors;
+    report.gpuMillis = gpuMillis;
+    writeFull(writeFd, &report, sizeof(report));
+}
+
+void waitForEvent(CUevent event, const char *desc) {
+    while (true) {
+        CUresult result = cuEventQuery(event);
+        if (result == CUDA_SUCCESS)
+            return;
+        if (result != CUDA_ERROR_NOT_READY)
+            checkError(result, desc);
+        usleep(1000);
+    }
+}
 
 template <class T> class GPU_Test {
   public:
+    static const int kReportSlots = 2;
+
     GPU_Test(int dev, TestMode mode, const char *kernelFile)
         : d_mode(mode), d_devNumber(dev), d_kernelFile(kernelFile),
           d_cublasLt(NULL), d_ltMatmulDesc(NULL), d_ltALayout(NULL),
@@ -245,8 +281,8 @@ template <class T> class GPU_Test {
             checkError(cublasSetMathMode(d_cublas, CUBLAS_TENSOR_OP_MATH));
 #endif
 
-        checkError(cuMemAllocHost((void **)&d_faultyElemsHost, sizeof(int)));
-        d_error = 0;
+        checkError(cuMemAllocHost((void **)&d_faultyElemsHost,
+                                  sizeof(int) * kReportSlots));
 
         g_running = true;
 
@@ -260,6 +296,8 @@ template <class T> class GPU_Test {
         checkError(cuMemFree(d_Cdata), "Free A");
         checkError(cuMemFree(d_Adata), "Free B");
         checkError(cuMemFree(d_Bdata), "Free C");
+        for (int i = 0; i < kReportSlots; ++i)
+            checkError(cuMemFree(d_faultyElemData[i]), "Free faulty data");
         cuMemFreeHost(d_faultyElemsHost);
         printf("Freed memory for dev %d\n", d_devNumber);
 
@@ -272,14 +310,7 @@ template <class T> class GPU_Test {
 
     static void termHandler(int signum) { g_running = false; }
 
-    unsigned long long int getErrors() {
-        if (*d_faultyElemsHost) {
-            d_error += (long long int)*d_faultyElemsHost;
-        }
-        unsigned long long int tempErrs = d_error;
-        d_error = 0;
-        return tempErrs;
-    }
+    int getErrors(int slot) { return d_faultyElemsHost[slot]; }
 
     size_t getIters() { return d_iters; }
 
@@ -299,7 +330,7 @@ template <class T> class GPU_Test {
         return freeMem;
     }
 
-    void initBuffers(T *A, T *B, ssize_t useBytes = 0) {
+    void initBuffers(ssize_t useBytes = 0) {
         bind();
 
         if (useBytes == 0)
@@ -324,16 +355,15 @@ template <class T> class GPU_Test {
         checkError(cuMemAlloc(&d_Adata, d_inputSize), "A alloc");
         checkError(cuMemAlloc(&d_Bdata, d_inputSize), "B alloc");
 
-        checkError(cuMemAlloc(&d_faultyElemData, sizeof(int)), "faulty data");
-
-        // Populating matrices A and B
-        checkError(cuMemcpyHtoD(d_Adata, A, d_inputSize), "A -> device");
-        checkError(cuMemcpyHtoD(d_Bdata, B, d_inputSize), "B -> device");
+        for (int i = 0; i < kReportSlots; ++i)
+            checkError(cuMemAlloc(&d_faultyElemData[i], sizeof(int)),
+                       "faulty data");
 
         if (isFp8Mode(d_mode))
             initFp8Matmul();
 
         initCompareKernel();
+        initInputBuffers();
     }
 
     void compute() {
@@ -409,28 +439,30 @@ template <class T> class GPU_Test {
 
         checkError(cuFuncSetCacheConfig(d_function, CU_FUNC_CACHE_PREFER_L1),
                    "L1 config");
-        const size_t faultyElemOffset = __alignof(void *);
-        const size_t itersOffset = faultyElemOffset + __alignof(int *);
-        checkError(cuParamSetSize(d_function, itersOffset + sizeof(size_t)),
-                   "set param size");
-        checkError(cuParamSetv(d_function, 0, &d_Cdata, sizeof(CUdeviceptr)),
-                   "set param");
-        checkError(cuParamSetv(d_function, faultyElemOffset, &d_faultyElemData,
-                               sizeof(CUdeviceptr)),
-                   "set param");
-        checkError(cuParamSetv(d_function, itersOffset, &d_iters, sizeof(size_t)),
-                   "set param");
+        const char *initKernel = "initFloat";
+        if (d_mode == TEST_FP64)
+            initKernel = "initDouble";
+        else if (d_mode == TEST_BF16)
+            initKernel = "initBfloat16";
+        else if (d_mode == TEST_FP8_E4M3)
+            initKernel = "initFp8E4m3";
+        else if (d_mode == TEST_FP8_E5M2)
+            initKernel = "initFp8E5m2";
 
-        checkError(cuFuncSetBlockShape(d_function, g_blockSize, g_blockSize, 1),
-                   "set block size");
+        checkError(cuModuleGetFunction(&d_initFunction, d_module, initKernel),
+                   "get init func");
     }
 
-    void compare() {
-        checkError(cuMemsetD32Async(d_faultyElemData, 0, 1, 0), "memset");
-        checkError(cuLaunchGridAsync(d_function, SIZE / g_blockSize,
-                                     SIZE / g_blockSize, 0),
+    void compare(int slot) {
+        checkError(cuMemsetD32Async(d_faultyElemData[slot], 0, 1, 0),
+                   "memset");
+        void *params[] = {&d_Cdata, &d_faultyElemData[slot], &d_iters};
+        checkError(cuLaunchKernel(d_function, SIZE / g_blockSize,
+                                  SIZE / g_blockSize, 1, g_blockSize,
+                                  g_blockSize, 1, 0, 0, params, NULL),
                    "Launch grid");
-        checkError(cuMemcpyDtoHAsync(d_faultyElemsHost, d_faultyElemData,
+        checkError(cuMemcpyDtoHAsync(d_faultyElemsHost + slot,
+                                     d_faultyElemData[slot],
                                      sizeof(int), 0),
                    "Read faultyelemdata");
     }
@@ -438,6 +470,17 @@ template <class T> class GPU_Test {
     bool shouldRun() { return g_running; }
 
   private:
+    void initInputBuffers() {
+        const size_t elements = SIZE * SIZE;
+        const unsigned int threads = 256;
+        const unsigned int blocks =
+            (unsigned int)((elements + threads - 1) / threads);
+        void *params[] = {&d_Adata, &d_Bdata, (void *)&elements};
+        checkError(cuLaunchKernel(d_initFunction, blocks, 1, 1, threads, 1, 1,
+                                  0, 0, params, NULL),
+                   "init inputs");
+    }
+
     void initFp8Matmul() {
 #if CUBLAS_VERSION >= 11000
         const cudaDataType_t fp8Type = inputDataType(d_mode);
@@ -527,19 +570,18 @@ template <class T> class GPU_Test {
     size_t d_iters;
     size_t d_resultSize;
 
-    long long int d_error;
-
     static const int g_blockSize = 16;
 
     CUdevice d_dev;
     CUcontext d_ctx;
     CUmodule d_module;
     CUfunction d_function;
+    CUfunction d_initFunction;
 
     CUdeviceptr d_Cdata;
     CUdeviceptr d_Adata;
     CUdeviceptr d_Bdata;
-    CUdeviceptr d_faultyElemData;
+    CUdeviceptr d_faultyElemData[kReportSlots];
     int *d_faultyElemsHost;
 
     cublasHandle_t d_cublas;
@@ -583,12 +625,12 @@ int initCuda() {
 }
 
 template <class T>
-void startBurn(int index, int writeFd, T *A, T *B, TestMode mode,
-               ssize_t useBytes, const char *kernelFile) {
+void startBurn(int index, int writeFd, TestMode mode, ssize_t useBytes,
+               const char *kernelFile) {
     GPU_Test<T> *our;
     try {
         our = new GPU_Test<T>(index, mode, kernelFile);
-        our->initBuffers(A, B, useBytes);
+        our->initBuffers(useBytes);
     } catch (const std::exception &e) {
         fprintf(stderr, "Couldn't init a GPU test: %s\n", e.what());
         exit(EMEDIUMTYPE);
@@ -596,46 +638,59 @@ void startBurn(int index, int writeFd, T *A, T *B, TestMode mode,
 
     // The actual work
     try {
-        int eventIndex = 0;
-        const int maxEvents = 2;
-        CUevent events[maxEvents];
-        for (int i = 0; i < maxEvents; ++i)
-            cuEventCreate(events + i, 0);
-
-        int nonWorkIters = maxEvents;
-
-        while (our->shouldRun()) {
-            our->compute();
-            our->compare();
-            checkError(cuEventRecord(events[eventIndex], 0), "Record event");
-
-            eventIndex = ++eventIndex % maxEvents;
-
-            while (cuEventQuery(events[eventIndex]) != CUDA_SUCCESS)
-                usleep(1000);
-
-            if (--nonWorkIters > 0)
-                continue;
-
-            int ops = our->getIters();
-            write(writeFd, &ops, sizeof(int));
-            ops = our->getErrors();
-            write(writeFd, &ops, sizeof(int));
+        int reportSlot = 0;
+        const int reportSlots = GPU_Test<T>::kReportSlots;
+        CUevent startEvents[reportSlots];
+        CUevent stopEvents[reportSlots];
+        bool pendingReports[reportSlots];
+        for (int i = 0; i < reportSlots; ++i) {
+            pendingReports[i] = false;
+            checkError(cuEventCreate(startEvents + i, CU_EVENT_DEFAULT),
+                       "Create start event");
+            checkError(cuEventCreate(stopEvents + i, CU_EVENT_DEFAULT),
+                       "Create stop event");
         }
 
-        for (int i = 0; i < maxEvents; ++i)
-            cuEventSynchronize(events[i]);
+        while (our->shouldRun()) {
+            checkError(cuEventRecord(startEvents[reportSlot], 0),
+                       "Record start event");
+            our->compute();
+            our->compare(reportSlot);
+            checkError(cuEventRecord(stopEvents[reportSlot], 0),
+                       "Record stop event");
+            pendingReports[reportSlot] = true;
+
+            int finishedSlot = (reportSlot + 1) % reportSlots;
+            if (pendingReports[finishedSlot]) {
+                float gpuMillis = 0.0f;
+                waitForEvent(stopEvents[finishedSlot], "Wait stop event");
+                checkError(cuEventElapsedTime(&gpuMillis,
+                                              startEvents[finishedSlot],
+                                              stopEvents[finishedSlot]),
+                           "GPU elapsed time");
+                writeClientReport(writeFd, (int)our->getIters(),
+                                  our->getErrors(finishedSlot), gpuMillis);
+                pendingReports[finishedSlot] = false;
+            }
+
+            reportSlot = finishedSlot;
+        }
+
+        for (int i = 0; i < reportSlots; ++i) {
+            if (pendingReports[i])
+                cuEventSynchronize(stopEvents[i]);
+            cuEventDestroy(startEvents[i]);
+            cuEventDestroy(stopEvents[i]);
+        }
         delete our;
     } catch (const std::exception &e) {
         fprintf(stderr, "Failure during compute: %s\n", e.what());
-        int ops = -1;
-        // Signalling that we failed
-        write(writeFd, &ops, sizeof(int));
-        write(writeFd, &ops, sizeof(int));
+        writeClientReport(writeFd, -1, -1, 0.0f);
         exit(ECONNREFUSED);
     }
 }
 
+#if IS_JETSON
 int pollTemp(pid_t *p) {
     int tempPipe[2];
     pipe(tempPipe);
@@ -645,14 +700,8 @@ int pollTemp(pid_t *p) {
     if (!myPid) {
         close(tempPipe[0]);
         dup2(tempPipe[1], STDOUT_FILENO);
-#if IS_JETSON
         execlp("tegrastats", "tegrastats", "--interval", "5000", NULL);
         fprintf(stderr, "Could not invoke tegrastats, no temps available\n");
-#else
-        execlp("nvidia-smi", "nvidia-smi", "-l", "5", "-q", "-d", "TEMPERATURE",
-               NULL);
-        fprintf(stderr, "Could not invoke nvidia-smi, no temps available\n");
-#endif
 
         exit(ENODEV);
     }
@@ -675,7 +724,6 @@ void updateTemps(int handle, std::vector<int> *temps) {
 
     data[curPos - 1] = 0;
 
-#if IS_JETSON
     std::string data_str(data);
     std::regex pattern("GPU@([0-9]+)C");
     std::smatch matches;
@@ -686,32 +734,79 @@ void updateTemps(int handle, std::vector<int> *temps) {
             gpuIter = (gpuIter + 1) % (temps->size());
         }
     }
-#else
-    // FIXME: The syntax of this print might change in the future..
-    int tempValue;
-    if (sscanf(data,
-               "		GPU Current Temp			: %d C",
-               &tempValue) == 1) {
-        temps->at(gpuIter) = tempValue;
-        gpuIter = (gpuIter + 1) % (temps->size());
-    } else if (!strcmp(data, "		Gpu				"
-                             "	 : N/A"))
-        gpuIter =
-            (gpuIter + 1) %
-            (temps->size()); // We rotate the iterator for N/A values as well
-#endif
 }
+#else
+class TempMonitor {
+  public:
+    TempMonitor(const std::vector<int> &deviceIds) : d_initialized(false) {
+        nvmlReturn_t result = nvmlInit_v2();
+        if (result != NVML_SUCCESS) {
+            fprintf(stderr, "Could not init NVML, no temps available: %s\n",
+                    nvmlErrorString(result));
+            return;
+        }
+
+        d_initialized = true;
+        for (size_t i = 0; i < deviceIds.size(); ++i) {
+            nvmlDevice_t device = NULL;
+            result =
+                nvmlDeviceGetHandleByIndex_v2((unsigned int)deviceIds.at(i),
+                                               &device);
+            if (result != NVML_SUCCESS) {
+                fprintf(stderr,
+                        "Could not get NVML handle for GPU %d, no temp: %s\n",
+                        deviceIds.at(i), nvmlErrorString(result));
+            }
+            d_devices.push_back(device);
+        }
+    }
+
+    ~TempMonitor() {
+        if (d_initialized)
+            nvmlShutdown();
+    }
+
+    void update(std::vector<int> *temps) {
+        if (!d_initialized)
+            return;
+
+        for (size_t i = 0; i < d_devices.size() && i < temps->size(); ++i) {
+            if (!d_devices.at(i))
+                continue;
+
+            unsigned int temp = 0;
+            if (nvmlDeviceGetTemperature(d_devices.at(i),
+                                         NVML_TEMPERATURE_GPU,
+                                         &temp) == NVML_SUCCESS) {
+                temps->at(i) = (int)temp;
+            }
+        }
+    }
+
+  private:
+    bool d_initialized;
+    std::vector<nvmlDevice_t> d_devices;
+};
+#endif
 
 void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
+                   std::vector<int> clientDeviceIds,
                    int runTime, std::chrono::seconds sigterm_timeout_threshold_secs) {
     fd_set waitHandles;
 
+#if IS_JETSON
     pid_t tempPid;
     int tempHandle = pollTemp(&tempPid);
     int maxHandle = tempHandle;
+#else
+    TempMonitor tempMonitor(clientDeviceIds);
+    int maxHandle = -1;
+#endif
 
     FD_ZERO(&waitHandles);
+#if IS_JETSON
     FD_SET(tempHandle, &waitHandles);
+#endif
 
     for (size_t i = 0; i < clientFd.size(); ++i) {
         if (clientFd.at(i) > maxHandle)
@@ -722,7 +817,6 @@ void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
     std::vector<int> clientTemp;
     std::vector<int> clientErrors;
     std::vector<int> clientCalcs;
-    std::vector<struct timespec> clientUpdateTime;
     std::vector<float> clientGflops;
     std::vector<bool> clientFaulty;
 
@@ -732,9 +826,6 @@ void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
         clientTemp.push_back(0);
         clientErrors.push_back(0);
         clientCalcs.push_back(0);
-        struct timespec thisTime;
-        clock_gettime(CLOCK_REALTIME, &thisTime);
-        clientUpdateTime.push_back(thisTime);
         clientGflops.push_back(0.0f);
         clientFaulty.push_back(false);
     }
@@ -742,59 +833,81 @@ void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
     int changeCount;
     float nextReport = 10.0f;
     bool childReport = false;
-    while (
-        (changeCount = select(maxHandle + 1, &waitHandles, NULL, NULL, NULL))) {
+    time_t lastPrintTime = 0;
+    while (true) {
+        struct timeval selectTimeout;
+        selectTimeout.tv_sec = 1;
+        selectTimeout.tv_usec = 0;
+        changeCount = select(maxHandle + 1, &waitHandles, NULL, NULL,
+                             &selectTimeout);
+        if (changeCount < 0) {
+            if (errno == EINTR) {
+                FD_ZERO(&waitHandles);
+#if IS_JETSON
+                FD_SET(tempHandle, &waitHandles);
+#endif
+                for (size_t i = 0; i < clientFd.size(); ++i)
+                    FD_SET(clientFd.at(i), &waitHandles);
+                continue;
+            }
+            perror("select");
+            exit(errno);
+        }
+
         size_t thisTime = time(0);
-        struct timespec thisTimeSpec;
-        clock_gettime(CLOCK_REALTIME, &thisTimeSpec);
+        bool clientReportThisLoop = false;
 
         // Going through all descriptors
-        for (size_t i = 0; i < clientFd.size(); ++i)
+        for (size_t i = 0; changeCount > 0 && i < clientFd.size(); ++i)
             if (FD_ISSET(clientFd.at(i), &waitHandles)) {
-                // First, reading processed
-                int processed, errors;
-                int res = read(clientFd.at(i), &processed, sizeof(int));
-                if (res < sizeof(int)) {
-                    fprintf(stderr, "read[%zu] error %d", i, res);
-                    processed = -1;
+                ClientReport report;
+                if (!readFull(clientFd.at(i), &report, sizeof(report))) {
+                    fprintf(stderr, "read[%zu] error", i);
+                    report.processed = -1;
+                    report.errors = -1;
+                    report.gpuMillis = 0.0f;
                 }
-                // Then errors
-                read(clientFd.at(i), &errors, sizeof(int));
 
-                clientErrors.at(i) += errors;
-                if (processed == -1)
+                if (report.processed == -1) {
                     clientCalcs.at(i) = -1;
-                else {
-                    double flops = (double)processed * (double)OPS_PER_MUL;
-                    struct timespec clientPrevTime = clientUpdateTime.at(i);
-                    double clientTimeDelta =
-                        (double)thisTimeSpec.tv_sec +
-                        (double)thisTimeSpec.tv_nsec / 1000000000.0 -
-                        ((double)clientPrevTime.tv_sec +
-                         (double)clientPrevTime.tv_nsec / 1000000000.0);
-                    clientUpdateTime.at(i) = thisTimeSpec;
-
-                    clientGflops.at(i) =
-                        (double)((unsigned long long int)processed *
-                                 OPS_PER_MUL) /
-                        clientTimeDelta / 1000.0 / 1000.0 / 1000.0;
-                    clientCalcs.at(i) += processed;
+                    clientFaulty.at(i) = true;
+                } else {
+                    clientErrors.at(i) += report.errors;
+                    if (report.errors)
+                        clientFaulty.at(i) = true;
+                    if (report.gpuMillis > 0.0f) {
+                        clientGflops.at(i) =
+                            (double)((unsigned long long int)report.processed *
+                                     OPS_PER_MUL) /
+                            ((double)report.gpuMillis / 1000.0) /
+                            1000.0 / 1000.0 / 1000.0;
+                    }
+                    clientCalcs.at(i) += report.processed;
                 }
 
                 childReport = true;
+                clientReportThisLoop = true;
             }
 
-        if (FD_ISSET(tempHandle, &waitHandles))
+#if IS_JETSON
+        if (changeCount > 0 && FD_ISSET(tempHandle, &waitHandles))
             updateTemps(tempHandle, &clientTemp);
+#else
+        if (clientReportThisLoop)
+            tempMonitor.update(&clientTemp);
+#endif
 
         // Resetting the listeners
         FD_ZERO(&waitHandles);
+#if IS_JETSON
         FD_SET(tempHandle, &waitHandles);
+#endif
         for (size_t i = 0; i < clientFd.size(); ++i)
             FD_SET(clientFd.at(i), &waitHandles);
 
         // Printing progress (if a child has initted already)
-        if (childReport) {
+        if (childReport && clientReportThisLoop && thisTime != lastPrintTime) {
+            lastPrintTime = thisTime;
             float elapsed =
                 fminf((float)(thisTime - startTime) / (float)runTime * 100.0f,
                       100.0f);
@@ -828,17 +941,14 @@ void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
 
             fflush(stdout);
 
-            for (size_t i = 0; i < clientErrors.size(); ++i)
-                if (clientErrors.at(i))
-                    clientFaulty.at(i) = true;
-
             if (nextReport < elapsed) {
                 nextReport = elapsed + 10.0f;
-                printf("\n\tSummary at:   ");
-                fflush(stdout);
-                system("date"); // Printing a date
-                fflush(stdout);
-                printf("\n");
+                time_t now = time(NULL);
+                struct tm nowLocal;
+                char nowText[64];
+                localtime_r(&now, &nowLocal);
+                strftime(nowText, sizeof(nowText), "%c %Z", &nowLocal);
+                printf("\n\tSummary at:   %s\n\n", nowText);
                 for (size_t i = 0; i < clientErrors.size(); ++i)
                     clientErrors.at(i) = 0;
             }
@@ -863,7 +973,9 @@ void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
     for (size_t i = 0; i < clientPid.size(); ++i)
         kill(clientPid.at(i), SIGTERM);
 
+#if IS_JETSON
     kill(tempPid, SIGTERM);
+#endif
 
     // processes should be terminated by SIGTERM within threshold time (so wait and then check pids)
     std::this_thread::sleep_for(sigterm_timeout_threshold_secs);
@@ -879,6 +991,7 @@ void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
             killed_processes.push_back(return_pid);
         }
     }
+#if IS_JETSON
     // handle the tempPid
     int status;
     pid_t return_pid = waitpid(tempPid, &status, WNOHANG);
@@ -886,9 +999,14 @@ void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
         /* child is finished. exit status in status */
         killed_processes.push_back(return_pid);
     }
+#endif
 
     // number of killed process should be number GPUs + 1 (need to add tempPid process) to exit while loop early
-    if (killed_processes.size() != clientPid.size() + 1) {
+    size_t expectedKilled = clientPid.size();
+#if IS_JETSON
+    expectedKilled += 1;
+#endif
+    if (killed_processes.size() != expectedKilled) {
         printf("\nKilling processes with SIGKILL (force kill)\n");
 
         for (size_t i = 0; i < clientPid.size(); ++i) {
@@ -897,12 +1015,16 @@ void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
                 kill(clientPid.at(i), SIGKILL);
         }
 
+#if IS_JETSON
         // check if pid was already killed with SIGTERM before using SIGKILL
         if (std::find(killed_processes.begin(), killed_processes.end(), tempPid) == killed_processes.end())
             kill(tempPid, SIGKILL);
+#endif
     }
 
+#if IS_JETSON
     close(tempHandle);
+#endif
 
     while (wait(NULL) != -1)
         ;
@@ -917,26 +1039,6 @@ template <class T>
 void launch(int runLength, TestMode mode, ssize_t useBytes, int device_id,
             const char * kernelFile,
             std::chrono::seconds sigterm_timeout_threshold_secs) {
-#if IS_JETSON
-    std::ifstream f_model("/proc/device-tree/model");
-    std::stringstream ss_model;
-    ss_model << f_model.rdbuf();
-    printf("%s\n", ss_model.str().c_str());
-#else
-    system("nvidia-smi -L");
-#endif
-
-    // Initting A and B with random data
-    T *A = (T *)malloc(sizeof(T) * SIZE * SIZE);
-    T *B = (T *)malloc(sizeof(T) * SIZE * SIZE);
-    srand(10);
-    for (size_t i = 0; i < SIZE * SIZE; ++i) {
-        A[i] = convertInput<T>((float)((double)(rand() % 1000000) / 100000.0),
-                               mode);
-        B[i] = convertInput<T>((float)((double)(rand() % 1000000) / 100000.0),
-                               mode);
-    }
-
     // Forking a process..  This one checks the number of devices to use,
     // returns the value, and continues to use the first one.
     int mainPipe[2];
@@ -944,9 +1046,11 @@ void launch(int runLength, TestMode mode, ssize_t useBytes, int device_id,
     int readMain = mainPipe[0];
     std::vector<int> clientPipes;
     std::vector<pid_t> clientPids;
+    std::vector<int> clientDeviceIds;
     clientPipes.push_back(readMain);
 
     if (device_id > -1) {
+        clientDeviceIds.push_back(device_id);
         pid_t myPid = fork();
         if (!myPid) {
             // Child
@@ -955,7 +1059,7 @@ void launch(int runLength, TestMode mode, ssize_t useBytes, int device_id,
             initCuda();
             int devCount = 1;
             write(writeFd, &devCount, sizeof(int));
-            startBurn<T>(device_id, writeFd, A, B, mode, useBytes, kernelFile);
+            startBurn<T>(device_id, writeFd, mode, useBytes, kernelFile);
             close(writeFd);
             return;
         } else {
@@ -963,11 +1067,13 @@ void launch(int runLength, TestMode mode, ssize_t useBytes, int device_id,
             close(mainPipe[1]);
             int devCount;
             read(readMain, &devCount, sizeof(int));
-            listenClients(clientPipes, clientPids, runLength, sigterm_timeout_threshold_secs);
+            listenClients(clientPipes, clientPids, clientDeviceIds, runLength,
+                          sigterm_timeout_threshold_secs);
         }
         for (size_t i = 0; i < clientPipes.size(); ++i)
             close(clientPipes.at(i));
     } else {
+        clientDeviceIds.push_back(0);
         pid_t myPid = fork();
         if (!myPid) {
             // Child
@@ -976,7 +1082,7 @@ void launch(int runLength, TestMode mode, ssize_t useBytes, int device_id,
             int devCount = initCuda();
             write(writeFd, &devCount, sizeof(int));
 
-            startBurn<T>(0, writeFd, A, B, mode, useBytes, kernelFile);
+            startBurn<T>(0, writeFd, mode, useBytes, kernelFile);
 
             close(writeFd);
             return;
@@ -995,6 +1101,7 @@ void launch(int runLength, TestMode mode, ssize_t useBytes, int device_id,
                     int slavePipe[2];
                     pipe(slavePipe);
                     clientPipes.push_back(slavePipe[0]);
+                    clientDeviceIds.push_back(i);
 
                     pid_t slavePid = fork();
 
@@ -1002,7 +1109,7 @@ void launch(int runLength, TestMode mode, ssize_t useBytes, int device_id,
                         // Child
                         close(slavePipe[0]);
                         initCuda();
-                        startBurn<T>(i, slavePipe[1], A, B, mode, useBytes,
+                        startBurn<T>(i, slavePipe[1], mode, useBytes,
                                      kernelFile);
 
                         close(slavePipe[1]);
@@ -1013,15 +1120,13 @@ void launch(int runLength, TestMode mode, ssize_t useBytes, int device_id,
                     }
                 }
 
-                listenClients(clientPipes, clientPids, runLength, sigterm_timeout_threshold_secs);
+                listenClients(clientPipes, clientPids, clientDeviceIds,
+                              runLength, sigterm_timeout_threshold_secs);
             }
         }
         for (size_t i = 0; i < clientPipes.size(); ++i)
             close(clientPipes.at(i));
     }
-
-    free(A);
-    free(B);
 }
 
 void showHelp() {

@@ -26,6 +26,9 @@ override LDFLAGS  += -Wl,-rpath=${CUDAPATH}/lib
 override LDFLAGS  += -lcublas
 override LDFLAGS  += -lcublasLt
 override LDFLAGS  += -lcudart
+ifneq ($(IS_JETSON),true)
+override LDFLAGS  += -lnvidia-ml
+endif
 
 DETECTED_COMPUTE := $(shell if command -v nvidia-smi >/dev/null 2>&1; then \
 	nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null | \
