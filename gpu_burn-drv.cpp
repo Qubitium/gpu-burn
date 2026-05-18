@@ -63,6 +63,7 @@
 #define SIGTERM_TIMEOUT_THRESHOLD_SECS 30 // number of seconds for sigterm to kill child processes before forcing a sigkill
 
 #include "cublas_v2.h"
+#include "cublasLt.h"
 #define CUDA_ENABLE_DEPRECATED
 #include <cuda.h>
 #include <cuda_fp8.h>
@@ -220,7 +221,10 @@ bool g_running = false;
 template <class T> class GPU_Test {
   public:
     GPU_Test(int dev, TestMode mode, const char *kernelFile)
-        : d_mode(mode), d_devNumber(dev), d_kernelFile(kernelFile) {
+        : d_mode(mode), d_devNumber(dev), d_kernelFile(kernelFile),
+          d_cublasLt(NULL), d_ltMatmulDesc(NULL), d_ltALayout(NULL),
+          d_ltBLayout(NULL), d_ltCLayout(NULL), d_ltWorkspace(0),
+          d_ltWorkspaceSize(0) {
         checkError(cuDeviceGet(&d_dev, d_devNumber));
         checkModeSupported();
 #if defined(CUDA_VERSION) && CUDA_VERSION >= 13000
@@ -233,6 +237,8 @@ template <class T> class GPU_Test {
 
         // checkError(cublasInit());
         checkError(cublasCreate(&d_cublas), "init");
+        if (isFp8Mode(d_mode))
+            checkError(cublasLtCreate(&d_cublasLt), "init cuBLASLt");
 
 #if CUBLAS_VERSION < 11000
         if (d_mode == TEST_TF32)
@@ -257,6 +263,9 @@ template <class T> class GPU_Test {
         cuMemFreeHost(d_faultyElemsHost);
         printf("Freed memory for dev %d\n", d_devNumber);
 
+        destroyFp8Matmul();
+        if (d_cublasLt)
+            cublasLtDestroy(d_cublasLt);
         cublasDestroy(d_cublas);
         printf("Uninitted cublas\n");
     }
@@ -321,6 +330,9 @@ template <class T> class GPU_Test {
         checkError(cuMemcpyHtoD(d_Adata, A, d_inputSize), "A -> device");
         checkError(cuMemcpyHtoD(d_Bdata, B, d_inputSize), "B -> device");
 
+        if (isFp8Mode(d_mode))
+            initFp8Matmul();
+
         initCompareKernel();
     }
 
@@ -341,16 +353,32 @@ template <class T> class GPU_Test {
                     "DGEMM");
             } else {
 #if CUBLAS_VERSION >= 11000
-                checkError(
-                    cublasGemmEx(d_cublas, CUBLAS_OP_N, CUBLAS_OP_N, SIZE,
-                                 SIZE, SIZE, &alpha, (const void *)d_Adata,
-                                 inputDataType(d_mode), SIZE,
-                                 (const void *)d_Bdata, inputDataType(d_mode),
-                                 SIZE, &beta,
-                                 (void *)((float *)d_Cdata + i * SIZE * SIZE),
-                                 CUDA_R_32F, SIZE, computeType(d_mode),
-                                 CUBLAS_GEMM_DEFAULT),
-                    gemmModeName(d_mode));
+                if (isFp8Mode(d_mode)) {
+                    void *result =
+                        (void *)((float *)d_Cdata + i * SIZE * SIZE);
+                    checkError(
+                        cublasLtMatmul(
+                            d_cublasLt, d_ltMatmulDesc, &alpha,
+                            (const void *)d_Adata, d_ltALayout,
+                            (const void *)d_Bdata, d_ltBLayout, &beta, result,
+                            d_ltCLayout, result, d_ltCLayout, NULL,
+                            d_ltWorkspace ? (void *)d_ltWorkspace : NULL,
+                            d_ltWorkspaceSize, 0),
+                        gemmModeName(d_mode));
+                } else {
+                    checkError(
+                        cublasGemmEx(d_cublas, CUBLAS_OP_N, CUBLAS_OP_N, SIZE,
+                                     SIZE, SIZE, &alpha,
+                                     (const void *)d_Adata,
+                                     inputDataType(d_mode), SIZE,
+                                     (const void *)d_Bdata,
+                                     inputDataType(d_mode), SIZE, &beta,
+                                     (void *)((float *)d_Cdata +
+                                              i * SIZE * SIZE),
+                                     CUDA_R_32F, SIZE, computeType(d_mode),
+                                     CUBLAS_GEMM_DEFAULT),
+                        gemmModeName(d_mode));
+                }
 #else
                 if (d_mode != TEST_FP32 && d_mode != TEST_TF32) {
                     throw std::runtime_error(
@@ -410,6 +438,66 @@ template <class T> class GPU_Test {
     bool shouldRun() { return g_running; }
 
   private:
+    void initFp8Matmul() {
+#if CUBLAS_VERSION >= 11000
+        const cudaDataType_t fp8Type = inputDataType(d_mode);
+        const cublasOperation_t transA = CUBLAS_OP_T;
+        const cublasOperation_t transB = CUBLAS_OP_N;
+
+        checkError(cublasLtMatmulDescCreate(&d_ltMatmulDesc,
+                                            CUBLAS_COMPUTE_32F, CUDA_R_32F),
+                   "create FP8 matmul descriptor");
+        checkError(cublasLtMatmulDescSetAttribute(
+                       d_ltMatmulDesc, CUBLASLT_MATMUL_DESC_TRANSA, &transA,
+                       sizeof(transA)),
+                   "set FP8 transA");
+        checkError(cublasLtMatmulDescSetAttribute(
+                       d_ltMatmulDesc, CUBLASLT_MATMUL_DESC_TRANSB, &transB,
+                       sizeof(transB)),
+                   "set FP8 transB");
+
+        checkError(cublasLtMatrixLayoutCreate(&d_ltALayout, fp8Type, SIZE,
+                                              SIZE, SIZE),
+                   "create FP8 A layout");
+        checkError(cublasLtMatrixLayoutCreate(&d_ltBLayout, fp8Type, SIZE,
+                                              SIZE, SIZE),
+                   "create FP8 B layout");
+        checkError(cublasLtMatrixLayoutCreate(&d_ltCLayout, CUDA_R_32F, SIZE,
+                                              SIZE, SIZE),
+                   "create FP8 C layout");
+
+        d_ltWorkspaceSize = 64ul * 1024ul * 1024ul;
+        checkError(cuMemAlloc(&d_ltWorkspace, d_ltWorkspaceSize),
+                   "FP8 cuBLASLt workspace");
+#else
+        throw std::runtime_error("FP8 GEMM requires cuBLAS 11 or newer");
+#endif
+    }
+
+    void destroyFp8Matmul() {
+        if (d_ltWorkspace) {
+            cuMemFree(d_ltWorkspace);
+            d_ltWorkspace = 0;
+        }
+        if (d_ltCLayout) {
+            cublasLtMatrixLayoutDestroy(d_ltCLayout);
+            d_ltCLayout = NULL;
+        }
+        if (d_ltBLayout) {
+            cublasLtMatrixLayoutDestroy(d_ltBLayout);
+            d_ltBLayout = NULL;
+        }
+        if (d_ltALayout) {
+            cublasLtMatrixLayoutDestroy(d_ltALayout);
+            d_ltALayout = NULL;
+        }
+        if (d_ltMatmulDesc) {
+            cublasLtMatmulDescDestroy(d_ltMatmulDesc);
+            d_ltMatmulDesc = NULL;
+        }
+        d_ltWorkspaceSize = 0;
+    }
+
     void checkModeSupported() {
         int major, minor;
         checkError(cuDeviceGetAttribute(
@@ -455,6 +543,13 @@ template <class T> class GPU_Test {
     int *d_faultyElemsHost;
 
     cublasHandle_t d_cublas;
+    cublasLtHandle_t d_cublasLt;
+    cublasLtMatmulDesc_t d_ltMatmulDesc;
+    cublasLtMatrixLayout_t d_ltALayout;
+    cublasLtMatrixLayout_t d_ltBLayout;
+    cublasLtMatrixLayout_t d_ltCLayout;
+    CUdeviceptr d_ltWorkspace;
+    size_t d_ltWorkspaceSize;
 };
 
 // Returns the number of devices
