@@ -114,3 +114,14 @@ including Python dispatch overhead in the reported GEMM time.
 explicit optional mode and is skipped cleanly when the local cuBLASLt build does
 not support that exact datatype/layout/output combination. FP8 in the Python
 tool uses cuBLASLt directly and requires Compute Capability 8.9 or newer.
+
+If importing PyTorch fails with `undefined symbol: ncclCommResume`, PyTorch is
+loading an older incompatible NCCL runtime before the benchmark starts. Check
+which NCCL is being loaded with:
+
+```plain
+ldd ~/.local/lib/python*/site-packages/torch/lib/libtorch_cuda.so | grep nccl
+```
+
+Unset conflicting `LD_LIBRARY_PATH` entries or reinstall matching `torch` and
+`nvidia-nccl-cu13` packages.
