@@ -40,6 +40,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <cstdint>
 #include <cstring>
 #include <errno.h>
 #include <exception>
@@ -63,6 +65,116 @@
 #include "cublas_v2.h"
 #define CUDA_ENABLE_DEPRECATED
 #include <cuda.h>
+#include <cuda_fp8.h>
+
+enum TestMode {
+    TEST_FP32,
+    TEST_FP64,
+    TEST_TF32,
+    TEST_BF16,
+    TEST_FP8_E4M3,
+    TEST_FP8_E5M2
+};
+
+bool computeCapabilityAtLeast(int major, int minor, int reqMajor,
+                              int reqMinor) {
+    return major > reqMajor || (major == reqMajor && minor >= reqMinor);
+}
+
+bool isFp8Mode(TestMode mode) {
+    return mode == TEST_FP8_E4M3 || mode == TEST_FP8_E5M2;
+}
+
+bool usesDoubleOutput(TestMode mode) { return mode == TEST_FP64; }
+
+size_t resultElementSize(TestMode mode) {
+    return usesDoubleOutput(mode) ? sizeof(double) : sizeof(float);
+}
+
+const char *gemmModeName(TestMode mode) {
+    switch (mode) {
+    case TEST_FP64:
+        return "using DOUBLES";
+    case TEST_TF32:
+        return "using FLOATS (TF32 Tensor Cores)";
+    case TEST_BF16:
+        return "using BFLOAT16 Tensor Cores (FP32 accumulate/output)";
+    case TEST_FP8_E4M3:
+        return "using FP8 E4M3 Tensor Cores (FP32 accumulate/output)";
+    case TEST_FP8_E5M2:
+        return "using FP8 E5M2 Tensor Cores (FP32 accumulate/output)";
+    case TEST_FP32:
+    default:
+        return "using FLOATS (pedantic FP32)";
+    }
+}
+
+#if CUBLAS_VERSION >= 11000
+cudaDataType_t inputDataType(TestMode mode) {
+    switch (mode) {
+    case TEST_BF16:
+        return CUDA_R_16BF;
+    case TEST_FP8_E4M3:
+        return CUDA_R_8F_E4M3;
+    case TEST_FP8_E5M2:
+        return CUDA_R_8F_E5M2;
+    case TEST_FP32:
+    case TEST_TF32:
+    default:
+        return CUDA_R_32F;
+    }
+}
+
+cublasComputeType_t computeType(TestMode mode) {
+    switch (mode) {
+    case TEST_FP32:
+        return CUBLAS_COMPUTE_32F_PEDANTIC;
+    case TEST_TF32:
+        return CUBLAS_COMPUTE_32F_FAST_TF32;
+    case TEST_BF16:
+    case TEST_FP8_E4M3:
+    case TEST_FP8_E5M2:
+    default:
+        return CUBLAS_COMPUTE_32F;
+    }
+}
+#endif
+
+uint16_t floatToBfloat16(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    const uint32_t lsb = (bits >> 16) & 1u;
+    bits += 0x7fffu + lsb;
+    return (uint16_t)(bits >> 16);
+}
+
+template <class T> T convertInput(float value, TestMode mode) {
+    (void)mode;
+    return (T)value;
+}
+
+template <> uint16_t convertInput<uint16_t>(float value, TestMode mode) {
+    (void)mode;
+    return floatToBfloat16(value);
+}
+
+template <> uint8_t convertInput<uint8_t>(float value, TestMode mode) {
+    return __nv_cvt_float_to_fp8(
+        value, __NV_SATFINITE,
+        mode == TEST_FP8_E5M2 ? __NV_E5M2 : __NV_E4M3);
+}
+
+void selectTestMode(TestMode *mode, bool *modeSelected, TestMode selected,
+                    const char *arg) {
+    if (*modeSelected) {
+        fprintf(stderr, "Only one precision mode can be selected; got %s\n",
+                arg);
+        exit(EINVAL);
+    }
+
+    *mode = selected;
+    *modeSelected = true;
+}
 
 void _checkError(int rCode, std::string file, int line, std::string desc = "") {
     if (rCode != CUDA_SUCCESS) {
@@ -107,10 +219,10 @@ bool g_running = false;
 
 template <class T> class GPU_Test {
   public:
-    GPU_Test(int dev, bool doubles, bool tensors, const char *kernelFile)
-        : d_devNumber(dev), d_doubles(doubles), d_tensors(tensors),
-          d_kernelFile(kernelFile) {
+    GPU_Test(int dev, TestMode mode, const char *kernelFile)
+        : d_mode(mode), d_devNumber(dev), d_kernelFile(kernelFile) {
         checkError(cuDeviceGet(&d_dev, d_devNumber));
+        checkModeSupported();
 #if defined(CUDA_VERSION) && CUDA_VERSION >= 13000
         checkError(cuCtxCreate(&d_ctx, nullptr, 0, d_dev));
 #else
@@ -123,7 +235,7 @@ template <class T> class GPU_Test {
         checkError(cublasCreate(&d_cublas), "init");
 
 #if CUBLAS_VERSION < 11000
-        if (d_tensors)
+        if (d_mode == TEST_TF32)
             checkError(cublasSetMathMode(d_cublas, CUBLAS_TENSOR_OP_MATH));
 #endif
 
@@ -190,23 +302,24 @@ template <class T> class GPU_Test {
                "using %lu MB of it), %s\n",
                d_devNumber, totalMemory() / 1024ul / 1024ul,
                availMemory() / 1024ul / 1024ul, useBytes / 1024ul / 1024ul,
-               gemmModeName());
-        size_t d_resultSize = sizeof(T) * SIZE * SIZE;
-        d_iters = (useBytes - 2 * d_resultSize) /
-                  d_resultSize; // We remove A and B sizes
+               gemmModeName(d_mode));
+        const size_t d_inputSize = sizeof(T) * SIZE * SIZE;
+        d_resultSize = resultElementSize(d_mode) * SIZE * SIZE;
+        const size_t minBytes = 2 * d_inputSize + d_resultSize;
+        if ((size_t)useBytes < minBytes)
+            throw std::string("Low mem for result. aborting.\n");
+        d_iters = ((size_t)useBytes - 2 * d_inputSize) / d_resultSize;
         printf("Results are %zu bytes each, thus performing %zu iterations\n",
                d_resultSize, d_iters);
-        if ((size_t)useBytes < 3 * d_resultSize)
-            throw std::string("Low mem for result. aborting.\n");
         checkError(cuMemAlloc(&d_Cdata, d_iters * d_resultSize), "C alloc");
-        checkError(cuMemAlloc(&d_Adata, d_resultSize), "A alloc");
-        checkError(cuMemAlloc(&d_Bdata, d_resultSize), "B alloc");
+        checkError(cuMemAlloc(&d_Adata, d_inputSize), "A alloc");
+        checkError(cuMemAlloc(&d_Bdata, d_inputSize), "B alloc");
 
         checkError(cuMemAlloc(&d_faultyElemData, sizeof(int)), "faulty data");
 
         // Populating matrices A and B
-        checkError(cuMemcpyHtoD(d_Adata, A, d_resultSize), "A -> device");
-        checkError(cuMemcpyHtoD(d_Bdata, B, d_resultSize), "B -> device");
+        checkError(cuMemcpyHtoD(d_Adata, A, d_inputSize), "A -> device");
+        checkError(cuMemcpyHtoD(d_Bdata, B, d_inputSize), "B -> device");
 
         initCompareKernel();
     }
@@ -219,7 +332,7 @@ template <class T> class GPU_Test {
         static const double betaD = 0.0;
 
         for (size_t i = 0; i < d_iters; ++i) {
-            if (d_doubles) {
+            if (d_mode == TEST_FP64) {
                 checkError(
                     cublasDgemm(d_cublas, CUBLAS_OP_N, CUBLAS_OP_N, SIZE, SIZE,
                                 SIZE, &alphaD, (const double *)d_Adata, SIZE,
@@ -228,19 +341,21 @@ template <class T> class GPU_Test {
                     "DGEMM");
             } else {
 #if CUBLAS_VERSION >= 11000
-                const cublasComputeType_t computeType =
-                    d_tensors ? CUBLAS_COMPUTE_32F_FAST_TF32
-                              : CUBLAS_COMPUTE_32F_PEDANTIC;
                 checkError(
                     cublasGemmEx(d_cublas, CUBLAS_OP_N, CUBLAS_OP_N, SIZE,
                                  SIZE, SIZE, &alpha, (const void *)d_Adata,
-                                 CUDA_R_32F, SIZE, (const void *)d_Bdata,
-                                 CUDA_R_32F, SIZE, &beta,
+                                 inputDataType(d_mode), SIZE,
+                                 (const void *)d_Bdata, inputDataType(d_mode),
+                                 SIZE, &beta,
                                  (void *)((float *)d_Cdata + i * SIZE * SIZE),
-                                 CUDA_R_32F, SIZE, computeType,
+                                 CUDA_R_32F, SIZE, computeType(d_mode),
                                  CUBLAS_GEMM_DEFAULT),
-                    d_tensors ? "TF32 GEMM" : "FP32 GEMM");
+                    gemmModeName(d_mode));
 #else
+                if (d_mode != TEST_FP32 && d_mode != TEST_TF32) {
+                    throw std::runtime_error(
+                        "BF16 and FP8 GEMM require cuBLAS 11 or newer");
+                }
                 checkError(
                     cublasSgemm(d_cublas, CUBLAS_OP_N, CUBLAS_OP_N, SIZE, SIZE,
                                 SIZE, &alpha, (const float *)d_Adata, SIZE,
@@ -260,22 +375,22 @@ template <class T> class GPU_Test {
         }
         checkError(cuModuleLoad(&d_module, d_kernelFile), "load module");
         checkError(cuModuleGetFunction(&d_function, d_module,
-                                       d_doubles ? "compareD" : "compare"),
+                                       usesDoubleOutput(d_mode) ? "compareD"
+                                                                : "compare"),
                    "get func");
 
         checkError(cuFuncSetCacheConfig(d_function, CU_FUNC_CACHE_PREFER_L1),
                    "L1 config");
-        checkError(cuParamSetSize(d_function, __alignof(T *) +
-                                                  __alignof(int *) +
-                                                  __alignof(size_t)),
+        const size_t faultyElemOffset = __alignof(void *);
+        const size_t itersOffset = faultyElemOffset + __alignof(int *);
+        checkError(cuParamSetSize(d_function, itersOffset + sizeof(size_t)),
                    "set param size");
-        checkError(cuParamSetv(d_function, 0, &d_Cdata, sizeof(T *)),
+        checkError(cuParamSetv(d_function, 0, &d_Cdata, sizeof(CUdeviceptr)),
                    "set param");
-        checkError(cuParamSetv(d_function, __alignof(T *), &d_faultyElemData,
-                               sizeof(T *)),
+        checkError(cuParamSetv(d_function, faultyElemOffset, &d_faultyElemData,
+                               sizeof(CUdeviceptr)),
                    "set param");
-        checkError(cuParamSetv(d_function, __alignof(T *) + __alignof(int *),
-                               &d_iters, sizeof(size_t)),
+        checkError(cuParamSetv(d_function, itersOffset, &d_iters, sizeof(size_t)),
                    "set param");
 
         checkError(cuFuncSetBlockShape(d_function, g_blockSize, g_blockSize, 1),
@@ -295,21 +410,30 @@ template <class T> class GPU_Test {
     bool shouldRun() { return g_running; }
 
   private:
-    const char *gemmModeName() const {
-        if (d_doubles)
-            return "using DOUBLES";
+    void checkModeSupported() {
+        int major, minor;
+        checkError(cuDeviceGetAttribute(
+                       &major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                       d_dev),
+                   "device major capability");
+        checkError(cuDeviceGetAttribute(
+                       &minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                       d_dev),
+                   "device minor capability");
 
-#if CUBLAS_VERSION >= 11000
-        return d_tensors ? "using FLOATS (TF32 Tensor Cores)"
-                         : "using FLOATS (pedantic FP32)";
-#else
-        return d_tensors ? "using FLOATS (legacy Tensor Core math mode)"
-                         : "using FLOATS";
-#endif
+        if (d_mode == TEST_BF16 &&
+            !computeCapabilityAtLeast(major, minor, 8, 0)) {
+            throw std::runtime_error(
+                "BF16 GEMM requires compute capability 8.0 or newer");
+        }
+        if (isFp8Mode(d_mode) &&
+            !computeCapabilityAtLeast(major, minor, 8, 9)) {
+            throw std::runtime_error(
+                "FP8 GEMM requires compute capability 8.9 or newer");
+        }
     }
 
-    bool d_doubles;
-    bool d_tensors;
+    TestMode d_mode;
     int d_devNumber;
     const char *d_kernelFile;
     size_t d_iters;
@@ -364,11 +488,11 @@ int initCuda() {
 }
 
 template <class T>
-void startBurn(int index, int writeFd, T *A, T *B, bool doubles, bool tensors,
+void startBurn(int index, int writeFd, T *A, T *B, TestMode mode,
                ssize_t useBytes, const char *kernelFile) {
     GPU_Test<T> *our;
     try {
-        our = new GPU_Test<T>(index, doubles, tensors, kernelFile);
+        our = new GPU_Test<T>(index, mode, kernelFile);
         our->initBuffers(A, B, useBytes);
     } catch (const std::exception &e) {
         fprintf(stderr, "Couldn't init a GPU test: %s\n", e.what());
@@ -695,8 +819,8 @@ void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
 }
 
 template <class T>
-void launch(int runLength, bool useDoubles, bool useTensorCores,
-            ssize_t useBytes, int device_id, const char * kernelFile,
+void launch(int runLength, TestMode mode, ssize_t useBytes, int device_id,
+            const char * kernelFile,
             std::chrono::seconds sigterm_timeout_threshold_secs) {
 #if IS_JETSON
     std::ifstream f_model("/proc/device-tree/model");
@@ -712,8 +836,10 @@ void launch(int runLength, bool useDoubles, bool useTensorCores,
     T *B = (T *)malloc(sizeof(T) * SIZE * SIZE);
     srand(10);
     for (size_t i = 0; i < SIZE * SIZE; ++i) {
-        A[i] = (T)((double)(rand() % 1000000) / 100000.0);
-        B[i] = (T)((double)(rand() % 1000000) / 100000.0);
+        A[i] = convertInput<T>((float)((double)(rand() % 1000000) / 100000.0),
+                               mode);
+        B[i] = convertInput<T>((float)((double)(rand() % 1000000) / 100000.0),
+                               mode);
     }
 
     // Forking a process..  This one checks the number of devices to use,
@@ -734,8 +860,7 @@ void launch(int runLength, bool useDoubles, bool useTensorCores,
             initCuda();
             int devCount = 1;
             write(writeFd, &devCount, sizeof(int));
-            startBurn<T>(device_id, writeFd, A, B, useDoubles, useTensorCores,
-                         useBytes, kernelFile);
+            startBurn<T>(device_id, writeFd, A, B, mode, useBytes, kernelFile);
             close(writeFd);
             return;
         } else {
@@ -756,8 +881,7 @@ void launch(int runLength, bool useDoubles, bool useTensorCores,
             int devCount = initCuda();
             write(writeFd, &devCount, sizeof(int));
 
-            startBurn<T>(0, writeFd, A, B, useDoubles, useTensorCores,
-                         useBytes, kernelFile);
+            startBurn<T>(0, writeFd, A, B, mode, useBytes, kernelFile);
 
             close(writeFd);
             return;
@@ -783,8 +907,8 @@ void launch(int runLength, bool useDoubles, bool useTensorCores,
                         // Child
                         close(slavePipe[0]);
                         initCuda();
-                        startBurn<T>(i, slavePipe[1], A, B, useDoubles,
-                                     useTensorCores, useBytes, kernelFile);
+                        startBurn<T>(i, slavePipe[1], A, B, mode, useBytes,
+                                     kernelFile);
 
                         close(slavePipe[1]);
                         return;
@@ -813,6 +937,9 @@ void showHelp() {
            (int)(USEMEM * 100));
     printf("-d\tUse doubles\n");
     printf("-tc\tUse TF32 Tensor Core compute for float GEMM\n");
+    printf("-bf16\tUse BF16 Tensor Core compute with FP32 output\n");
+    printf("-fp8\tUse FP8 E4M3 Tensor Core compute with FP32 output\n");
+    printf("-fp8-e5m2\tUse FP8 E5M2 Tensor Core compute with FP32 output\n");
     printf("-l\tLists all GPUs in the system\n");
     printf("-i N\tExecute only on GPU N\n");
     printf("-c FILE\tUse FILE as compare kernel.  Default is %s\n",
@@ -843,8 +970,8 @@ ssize_t decodeUSEMEM(const char *s) {
 
 int main(int argc, char **argv) {
     int runLength = 10;
-    bool useDoubles = false;
-    bool useTensorCores = false;
+    TestMode testMode = TEST_FP32;
+    bool modeSelected = false;
     int thisParam = 0;
     ssize_t useBytes = 0; // 0 == use USEMEM% of free mem
     int device_id = -1;
@@ -875,14 +1002,30 @@ int main(int argc, char **argv) {
             thisParam++;
             return 0;
         }
-        if (argc >= 2 && std::string(argv[i]).find("-d") != std::string::npos) {
-            useDoubles = true;
+        if (argc >= 2 && args[i] == "-d") {
+            selectTestMode(&testMode, &modeSelected, TEST_FP64, argv[i]);
             thisParam++;
+            continue;
         }
-        if (argc >= 2 &&
-            std::string(argv[i]).find("-tc") != std::string::npos) {
-            useTensorCores = true;
+        if (argc >= 2 && args[i] == "-tc") {
+            selectTestMode(&testMode, &modeSelected, TEST_TF32, argv[i]);
             thisParam++;
+            continue;
+        }
+        if (argc >= 2 && args[i] == "-bf16") {
+            selectTestMode(&testMode, &modeSelected, TEST_BF16, argv[i]);
+            thisParam++;
+            continue;
+        }
+        if (argc >= 2 && (args[i] == "-fp8" || args[i] == "-fp8-e4m3")) {
+            selectTestMode(&testMode, &modeSelected, TEST_FP8_E4M3, argv[i]);
+            thisParam++;
+            continue;
+        }
+        if (argc >= 2 && args[i] == "-fp8-e5m2") {
+            selectTestMode(&testMode, &modeSelected, TEST_FP8_E5M2, argv[i]);
+            thisParam++;
+            continue;
         }
         if (argc >= 2 && strncmp(argv[i], "-m", 2) == 0) {
             thisParam++;
@@ -943,12 +1086,27 @@ int main(int argc, char **argv) {
     printf("Using compare file: %s\n", kernelFile);
     printf("Burning for %d seconds.\n", runLength);
 
-    if (useDoubles)
-        launch<double>(runLength, useDoubles, useTensorCores, useBytes,
-                       device_id, kernelFile, sigterm_timeout_threshold_secs);
-    else
-        launch<float>(runLength, useDoubles, useTensorCores, useBytes,
-                      device_id, kernelFile, sigterm_timeout_threshold_secs);
+    switch (testMode) {
+    case TEST_FP64:
+        launch<double>(runLength, testMode, useBytes, device_id, kernelFile,
+                       sigterm_timeout_threshold_secs);
+        break;
+    case TEST_BF16:
+        launch<uint16_t>(runLength, testMode, useBytes, device_id, kernelFile,
+                         sigterm_timeout_threshold_secs);
+        break;
+    case TEST_FP8_E4M3:
+    case TEST_FP8_E5M2:
+        launch<uint8_t>(runLength, testMode, useBytes, device_id, kernelFile,
+                        sigterm_timeout_threshold_secs);
+        break;
+    case TEST_FP32:
+    case TEST_TF32:
+    default:
+        launch<float>(runLength, testMode, useBytes, device_id, kernelFile,
+                      sigterm_timeout_threshold_secs);
+        break;
+    }
 
     return 0;
 }

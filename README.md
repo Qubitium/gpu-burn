@@ -83,6 +83,10 @@ can be set to change the resulting image tag:
     -m N%  Use N% of the available GPU memory
     -d     Use doubles
     -tc    Use TF32 Tensor Core compute for float GEMM
+    -bf16  Use BF16 Tensor Core compute with FP32 output
+    -fp8   Use FP8 E4M3 Tensor Core compute with FP32 output
+    -fp8-e5m2
+           Use FP8 E5M2 Tensor Core compute with FP32 output
     -l     List all GPUs in the system
     -i N   Execute only on GPU N
     -h     Show this help message
@@ -90,3 +94,6 @@ can be set to change the resulting image tag:
     Example:
     gpu_burn -d 3600
 ```
+
+BF16 mode requires Compute Capability 8.0 or newer. FP8 modes require Compute
+Capability 8.9 or newer; H100/H200 support these FP8 paths.
