@@ -121,11 +121,25 @@ FEATURES = [
         "Runs int8 x int8 -> int32 matrix multiply when PyTorch exposes it.",
     ),
     Feature(
+        "tensor_core_ldmatrix",
+        "Tensor Core ldmatrix matrix load",
+        (7, 5),
+        "compile_ldmatrix",
+        "Compiles a warp-level ldmatrix shared-memory load probe.",
+    ),
+    Feature(
         "tensor_core_tf32",
         "TF32 Tensor Core GEMM",
         (8, 0),
         "gemm_tf32",
         "Runs FP32 GEMM with TF32 enabled.",
+    ),
+    Feature(
+        "tensor_core_fp64_dmma",
+        "FP64 Tensor Core DMMA",
+        (8, 0),
+        "compile_mma_f64",
+        "Compiles an sm_80 FP64 mma.sync DMMA probe.",
     ),
     Feature(
         "tensor_core_bf16",
@@ -135,11 +149,46 @@ FEATURES = [
         "Runs BF16 matrix multiply through torch/cuBLAS.",
     ),
     Feature(
+        "tensor_core_subbyte_mma",
+        "Sub-byte INT4 Tensor Core MMA",
+        (8, 0),
+        "compile_mma_u4",
+        "Compiles an sm_80 u4 x u4 MMA probe.",
+    ),
+    Feature(
+        "tensor_core_binary_mma",
+        "Binary Tensor Core BMMA",
+        (8, 0),
+        "compile_mma_b1",
+        "Compiles an sm_80 b1 x b1 BMMA probe.",
+    ),
+    Feature(
         "ampere_cp_async",
         "Ampere cp.async shared-memory copy",
         (8, 0),
         "compile_cp_async",
         "Compiles an sm_80+ inline-PTX cp.async probe.",
+    ),
+    Feature(
+        "ampere_mbarrier",
+        "Ampere shared-memory mbarrier",
+        (8, 0),
+        "compile_mbarrier",
+        "Compiles sm_80 mbarrier init/invalidate instructions.",
+    ),
+    Feature(
+        "ampere_warp_redux",
+        "Ampere warp-wide redux.sync",
+        (8, 0),
+        "compile_redux_sync",
+        "Compiles sm_80 warp-wide integer reduction instructions.",
+    ),
+    Feature(
+        "ampere_l2_cache_hint",
+        "Ampere L2 cache hint / residency policy",
+        (8, 0),
+        "compile_l2_cache_hint",
+        "Compiles sm_80 createpolicy and L2 cache-hint load instructions.",
     ),
     Feature(
         "tensor_core_fp8",
@@ -399,6 +448,67 @@ VALIDATORS: dict[str, Callable] = {
 
 
 COMPILE_PROBES = {
+    "compile_ldmatrix": (
+        "sm_80",
+        r"""
+        #include <cuda_runtime.h>
+        extern "C" __global__ void probe(int* out) {
+            __shared__ int smem[64];
+            unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(smem));
+            unsigned d;
+            asm volatile("ldmatrix.sync.aligned.m8n8.x1.shared::cta.b16 {%0}, [%1];"
+                         : "=r"(d) : "r"(addr));
+            if (threadIdx.x == 0) out[0] = d;
+        }
+        """,
+    ),
+    "compile_mma_f64": (
+        "sm_80",
+        r"""
+        #include <cuda_runtime.h>
+        extern "C" __global__ void probe(double* out) {
+            double a = 1.0, b = 2.0, c0 = 0.0, c1 = 0.0, d0, d1;
+            asm volatile(
+                "mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64 "
+                "{%0, %1}, {%2}, {%3}, {%4, %5};"
+                : "=d"(d0), "=d"(d1)
+                : "d"(a), "d"(b), "d"(c0), "d"(c1));
+            if (threadIdx.x == 0) out[0] = d0 + d1;
+        }
+        """,
+    ),
+    "compile_mma_u4": (
+        "sm_80",
+        r"""
+        #include <cuda_runtime.h>
+        extern "C" __global__ void probe(int* out) {
+            unsigned a = 0x11111111u, b = 0x22222222u;
+            int c0 = 0, c1 = 0, d0, d1;
+            asm volatile(
+                "mma.sync.aligned.m8n8k32.row.col.satfinite.s32.u4.u4.s32 "
+                "{%0, %1}, {%2}, {%3}, {%4, %5};"
+                : "=r"(d0), "=r"(d1)
+                : "r"(a), "r"(b), "r"(c0), "r"(c1));
+            if (threadIdx.x == 0) out[0] = d0 + d1;
+        }
+        """,
+    ),
+    "compile_mma_b1": (
+        "sm_80",
+        r"""
+        #include <cuda_runtime.h>
+        extern "C" __global__ void probe(int* out) {
+            unsigned a = 0xffffffffu, b = 0x0f0f0f0fu;
+            int c0 = 0, c1 = 0, d0, d1;
+            asm volatile(
+                "mma.sync.aligned.m8n8k128.row.col.s32.b1.b1.s32.and.popc "
+                "{%0, %1}, {%2}, {%3}, {%4, %5};"
+                : "=r"(d0), "=r"(d1)
+                : "r"(a), "r"(b), "r"(c0), "r"(c1));
+            if (threadIdx.x == 0) out[0] = d0 + d1;
+        }
+        """,
+    ),
     "compile_cp_async": (
         "sm_80",
         r"""
@@ -413,6 +523,51 @@ COMPILE_PROBES = {
             asm volatile("cp.async.wait_group 0;");
             __syncthreads();
             if (threadIdx.x == 0) dst[0] = smem[0];
+        }
+        """,
+    ),
+    "compile_mbarrier": (
+        "sm_80",
+        r"""
+        #include <cuda_runtime.h>
+        extern "C" __global__ void probe(int* out) {
+            __shared__ unsigned long long barrier;
+            unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(&barrier));
+            if (threadIdx.x == 0) {
+                asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
+                             :: "r"(addr), "r"(1));
+                asm volatile("mbarrier.inval.shared::cta.b64 [%0];"
+                             :: "r"(addr));
+                out[0] = 1;
+            }
+        }
+        """,
+    ),
+    "compile_redux_sync": (
+        "sm_80",
+        r"""
+        #include <cuda_runtime.h>
+        extern "C" __global__ void probe(int* out) {
+            int src = threadIdx.x;
+            int dst;
+            asm volatile("redux.sync.add.s32 %0, %1, 0xffffffff;"
+                         : "=r"(dst) : "r"(src));
+            if (threadIdx.x == 0) out[0] = dst;
+        }
+        """,
+    ),
+    "compile_l2_cache_hint": (
+        "sm_80",
+        r"""
+        #include <cuda_runtime.h>
+        extern "C" __global__ void probe(const int* src, int* dst) {
+            unsigned long long policy;
+            int value;
+            asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;"
+                         : "=l"(policy));
+            asm volatile("ld.global.L2::cache_hint.b32 %0, [%1], %2;"
+                         : "=r"(value) : "l"(src), "l"(policy));
+            if (threadIdx.x == 0) dst[0] = value;
         }
         """,
     ),

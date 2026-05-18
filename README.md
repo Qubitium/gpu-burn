@@ -160,8 +160,10 @@ opposite-direction peer copies:
 compute capability. Runtime checks exercise memory copy, CUDA graphs, CUDA core
 arithmetic, atomics, and tensor-core GEMM modes that apply to the detected
 architecture. Optional compile probes check architecture-specific PTX and CUDA
-intrinsics such as Ampere `cp.async`, Hopper WGMMA, DPX and `cp.async.bulk`,
-and Blackwell `tcgen05`:
+intrinsics. For local `sm_80` Ampere GPUs, the compile probes cover `ldmatrix`,
+FP64 DMMA, INT4 MMA, binary BMMA, `cp.async`, `mbarrier`, `redux.sync`, and L2
+cache-hint policy instructions. Hopper probes cover WGMMA, DPX and
+`cp.async.bulk`; Blackwell probes cover `tcgen05`:
 
 ```plain
 ./gpu_ops.py --devices 0 --size 128 --compile-probes
