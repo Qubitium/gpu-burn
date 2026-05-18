@@ -108,12 +108,13 @@ bool g_running = false;
 template <class T> class GPU_Test {
   public:
     GPU_Test(int dev, bool doubles, bool tensors, const char *kernelFile)
-        : d_devNumber(dev), d_doubles(doubles), d_tensors(tensors), d_kernelFile(kernelFile){
+        : d_devNumber(dev), d_doubles(doubles), d_tensors(tensors),
+          d_kernelFile(kernelFile) {
         checkError(cuDeviceGet(&d_dev, d_devNumber));
 #if defined(CUDA_VERSION) && CUDA_VERSION >= 13000
-            checkError(cuCtxCreate(&d_ctx, nullptr, 0, d_dev));
+        checkError(cuCtxCreate(&d_ctx, nullptr, 0, d_dev));
 #else
-            checkError(cuCtxCreate(&d_ctx, 0, d_dev));
+        checkError(cuCtxCreate(&d_ctx, 0, d_dev));
 #endif
 
         bind();
@@ -121,8 +122,10 @@ template <class T> class GPU_Test {
         // checkError(cublasInit());
         checkError(cublasCreate(&d_cublas), "init");
 
+#if CUBLAS_VERSION < 11000
         if (d_tensors)
             checkError(cublasSetMathMode(d_cublas, CUBLAS_TENSOR_OP_MATH));
+#endif
 
         checkError(cuMemAllocHost((void **)&d_faultyElemsHost, sizeof(int)));
         d_error = 0;
@@ -184,11 +187,10 @@ template <class T> class GPU_Test {
             useBytes = (ssize_t)((double)availMemory() * (-useBytes / 100.0));
 
         printf("Initialized device %d with %lu MB of memory (%lu MB available, "
-               "using %lu MB of it), %s%s\n",
+               "using %lu MB of it), %s\n",
                d_devNumber, totalMemory() / 1024ul / 1024ul,
                availMemory() / 1024ul / 1024ul, useBytes / 1024ul / 1024ul,
-               d_doubles ? "using DOUBLES" : "using FLOATS",
-               d_tensors ? ", using Tensor Cores" : "");
+               gemmModeName());
         size_t d_resultSize = sizeof(T) * SIZE * SIZE;
         d_iters = (useBytes - 2 * d_resultSize) /
                   d_resultSize; // We remove A and B sizes
@@ -217,20 +219,36 @@ template <class T> class GPU_Test {
         static const double betaD = 0.0;
 
         for (size_t i = 0; i < d_iters; ++i) {
-            if (d_doubles)
+            if (d_doubles) {
                 checkError(
                     cublasDgemm(d_cublas, CUBLAS_OP_N, CUBLAS_OP_N, SIZE, SIZE,
                                 SIZE, &alphaD, (const double *)d_Adata, SIZE,
                                 (const double *)d_Bdata, SIZE, &betaD,
                                 (double *)d_Cdata + i * SIZE * SIZE, SIZE),
                     "DGEMM");
-            else
+            } else {
+#if CUBLAS_VERSION >= 11000
+                const cublasComputeType_t computeType =
+                    d_tensors ? CUBLAS_COMPUTE_32F_FAST_TF32
+                              : CUBLAS_COMPUTE_32F_PEDANTIC;
+                checkError(
+                    cublasGemmEx(d_cublas, CUBLAS_OP_N, CUBLAS_OP_N, SIZE,
+                                 SIZE, SIZE, &alpha, (const void *)d_Adata,
+                                 CUDA_R_32F, SIZE, (const void *)d_Bdata,
+                                 CUDA_R_32F, SIZE, &beta,
+                                 (void *)((float *)d_Cdata + i * SIZE * SIZE),
+                                 CUDA_R_32F, SIZE, computeType,
+                                 CUBLAS_GEMM_DEFAULT),
+                    d_tensors ? "TF32 GEMM" : "FP32 GEMM");
+#else
                 checkError(
                     cublasSgemm(d_cublas, CUBLAS_OP_N, CUBLAS_OP_N, SIZE, SIZE,
                                 SIZE, &alpha, (const float *)d_Adata, SIZE,
                                 (const float *)d_Bdata, SIZE, &beta,
                                 (float *)d_Cdata + i * SIZE * SIZE, SIZE),
                     "SGEMM");
+#endif
+            }
         }
     }
 
@@ -277,6 +295,19 @@ template <class T> class GPU_Test {
     bool shouldRun() { return g_running; }
 
   private:
+    const char *gemmModeName() const {
+        if (d_doubles)
+            return "using DOUBLES";
+
+#if CUBLAS_VERSION >= 11000
+        return d_tensors ? "using FLOATS (TF32 Tensor Cores)"
+                         : "using FLOATS (pedantic FP32)";
+#else
+        return d_tensors ? "using FLOATS (legacy Tensor Core math mode)"
+                         : "using FLOATS";
+#endif
+    }
+
     bool d_doubles;
     bool d_tensors;
     int d_devNumber;
@@ -781,7 +812,7 @@ void showHelp() {
     printf("-m N%%\tUse N%% of the available GPU memory.  Default is %d%%\n",
            (int)(USEMEM * 100));
     printf("-d\tUse doubles\n");
-    printf("-tc\tTry to use Tensor cores\n");
+    printf("-tc\tUse TF32 Tensor Core compute for float GEMM\n");
     printf("-l\tLists all GPUs in the system\n");
     printf("-i N\tExecute only on GPU N\n");
     printf("-c FILE\tUse FILE as compare kernel.  Default is %s\n",

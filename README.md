@@ -14,8 +14,8 @@ Multi-GPU CUDA stress test
 ```plain
 git clone https://github.com/wilicc/gpu-burn
 cd gpu-burn
-docker build -t gpu_burn .
-docker run --rm --gpus all gpu_burn
+make image
+docker run --rm --gpus all gpu-burn
 ```
 
 ## Binary packages
@@ -32,7 +32,11 @@ To remove artifacts built by GPU Burn:
 
 `make clean`
 
-GPU Burn builds with a default Compute Capability of 7.5 as specified on NVIDIA's [CUDA GPU Compute Capability](https://developer.nvidia.com/cuda-gpus).
+GPU Burn builds for the highest visible GPU compute capability reported by `nvidia-smi`.
+On H100/H200 systems this selects Compute Capability 9.0 (`COMPUTE=90`).
+If no GPU capability can be detected, GPU Burn falls back to Compute Capability 7.5.
+On mixed-generation systems, set `COMPUTE` to the lowest capability you intend
+to run because the compare PTX must be loadable by every selected GPU.
 To override this with a different value:
 
 `make COMPUTE=<compute capability value>`
@@ -67,7 +71,7 @@ CUDA_VERSION and IMAGE_DISTRO can be used to override the base
 images used when building the Docker `image` target, while IMAGE_NAME
 can be set to change the resulting image tag:
 
-`make IMAGE_NAME=myregistry.private.com/gpu-burn CUDA_VERSION=12.0.1 IMAGE_DISTRO=ubuntu22.04 image`
+`make IMAGE_NAME=myregistry.private.com/gpu-burn CUDA_VERSION=13.0.0 IMAGE_DISTRO=ubuntu22.04 image`
 
 ## Usage
 
@@ -78,7 +82,7 @@ can be set to change the resulting image tag:
     -m X   Use X MB of memory
     -m N%  Use N% of the available GPU memory
     -d     Use doubles
-    -tc    Try to use Tensor cores (if available)
+    -tc    Use TF32 Tensor Core compute for float GEMM
     -l     List all GPUs in the system
     -i N   Execute only on GPU N
     -h     Show this help message

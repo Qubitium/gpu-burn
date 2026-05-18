@@ -26,8 +26,13 @@ override LDFLAGS  += -Wl,-rpath=${CUDAPATH}/lib
 override LDFLAGS  += -lcublas
 override LDFLAGS  += -lcudart
 
-COMPUTE      ?= 75
-CUDA_VERSION ?= 11.8.0
+DETECTED_COMPUTE := $(shell if command -v nvidia-smi >/dev/null 2>&1; then \
+	nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null | \
+	awk 'BEGIN { max = 0 } /^[[:space:]]*[0-9]+[.][0-9]+[[:space:]]*$$/ { gsub(/[[:space:].]/, "", $$0); if ($$0 + 0 > max) max = $$0 + 0 } END { if (max > 0) print max }'; \
+	fi)
+
+COMPUTE      ?= $(if $(DETECTED_COMPUTE),$(DETECTED_COMPUTE),75)
+CUDA_VERSION ?= 13.0.0
 IMAGE_DISTRO ?= ubi8
 
 override NVCCFLAGS ?=
@@ -51,4 +56,4 @@ clean:
 	$(RM) *.ptx *.o gpu_burn
 
 image:
-	docker build --build-arg CUDA_VERSION=${CUDA_VERSION} --build-arg IMAGE_DISTRO=${IMAGE_DISTRO} -t ${IMAGE_NAME} .
+	docker build --build-arg CUDA_VERSION=${CUDA_VERSION} --build-arg IMAGE_DISTRO=${IMAGE_DISTRO} --build-arg COMPUTE=${COMPUTE} -t ${IMAGE_NAME} .
